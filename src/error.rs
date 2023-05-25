@@ -1,7 +1,7 @@
 use thiserror::Error;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 
-use crate::ToMain;
+use crate::state_machine::PoolInput;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -17,11 +17,16 @@ pub enum Error {
     #[error("Failed to send to: {0}")]
     NoWebsocketConnection(String),
 
-    #[error("Failed to send to main pool channel: {0:?}")]
-    FailedToSendToMain(ToMain),
-
+    // #[error("Failed to send to main pool channel: {0:?}")]
+    // FailedToSendToMain(ToMain),
     #[error("Failed to send to a channel: {0}")]
     SendError(String),
+
+    #[error("Failed to send to pool task: {0} - PoolInput: {1:?}")]
+    SendToPoolTaskFailed(String, PoolInput),
+
+    #[error("Failed to send to websocket: {0}")]
+    FailedToSendToSocket(String),
 }
 
 #[derive(Error, Debug)]
