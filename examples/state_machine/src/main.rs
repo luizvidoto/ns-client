@@ -5,7 +5,7 @@ use std::{
 };
 
 use log::debug;
-use nostr::{RelayMessage, Url};
+use nostr::RelayMessage;
 
 const ACC_1: &'static str = "4510459b74db68371be462f19ef4f7ef1e6c5a95b1d83a7adf00987c51ac56fe";
 
@@ -34,7 +34,6 @@ async fn main() {
     // Create a new instance of Instant, which marks the current point in time.
     let start = Instant::now();
 
-    let mut relays = HashMap::new();
     let mut events: HashMap<nostr::Url, (nostr::SubscriptionId, Vec<nostr::Event>)> =
         HashMap::new();
 
@@ -42,7 +41,7 @@ async fn main() {
     let keys = nostr::Keys::new(secret_key);
     let public_key = keys.public_key();
 
-    let mut pool = ns_client::RelayPool::new();
+    let pool = ns_client::RelayPool::new();
     let mut notifications = pool.notifications();
     println!("APP: Connecting to pool");
 
@@ -55,10 +54,10 @@ async fn main() {
         log::error!("Failed to subscribe to metadata: {}", e);
     }
 
-    let mut relay_servers = (100..150)
+    let mut relay_servers = (15..16)
         .flat_map(|n| {
-            (10..20)
-                .map(|m| format!("ws://192.168.{}.{}:8080", m, n))
+            (119..120)
+                .map(|m| format!("ws://192.168.{}.{}:8080", n, m))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -70,7 +69,7 @@ async fn main() {
     for url in relay_servers.iter() {
         match pool.add_relay(url) {
             Ok(url) => {
-                relays.insert(url, RelayStatus::Disconnected);
+                debug!("Added relay: {}", url);
             }
             Err(e) => {
                 debug!("Failed to add relay: {}", e);
@@ -79,9 +78,20 @@ async fn main() {
     }
 
     println!("APP: Relays: {}", relay_servers.len());
-    println!("APP: Added relays: {}", relays.len());
 
     let mut terminated_relays: HashSet<String> = HashSet::new();
+
+    let pool_1 = pool.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(status) = pool_1.relay_status_list().await {
+                for (url, status) in status.iter() {
+                    println!("APP: {}: {}", url, status)
+                }
+            }
+        }
+    });
 
     while let Ok(event) = notifications.recv().await {
         match event {
@@ -90,7 +100,6 @@ async fn main() {
             }
             ns_client::NotificationEvent::RelayTerminated(url) => {
                 debug!("APP: relay terminated: {}", &url);
-                relays.get_mut(&url).map(|r| *r = RelayStatus::Terminated);
                 terminated_relays.insert(url.to_string());
                 RELAY_SUGGESTIONS.iter().for_each(|r| {
                     if terminated_relays.contains(&r.to_string()) {
@@ -139,35 +148,7 @@ async fn main() {
         }
     }
 
-    // for (url, status) in relays.iter() {
-    //     println!("APP: {}: {}", url, status)
-    // }
-    // println!("                               ");
-
-    // tokio::time::sleep(Duration::from_secs(10)).await;
-
-    println!("APP: Relays: {}", relays.len());
-    if let Some(status) = relays.get(&Url::parse("ws://192.168.15.119:8080").unwrap()) {
-        println!("APP: Status: ws://192.168.15.119:8080 - {}", status);
-    }
     println!("APP: Done");
-}
-
-enum RelayStatus {
-    Connected,
-    Connecting,
-    Disconnected,
-    Terminated,
-}
-impl std::fmt::Display for RelayStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RelayStatus::Connected => write!(f, "Connected"),
-            RelayStatus::Connecting => write!(f, "Connecting"),
-            RelayStatus::Disconnected => write!(f, "Disconnected"),
-            RelayStatus::Terminated => write!(f, "Terminated"),
-        }
-    }
 }
 
 pub fn nostr_kinds() -> Vec<nostr::Kind> {

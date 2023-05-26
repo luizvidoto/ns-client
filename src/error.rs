@@ -27,6 +27,9 @@ pub enum Error {
 
     #[error("Failed to send to websocket: {0}")]
     FailedToSendToSocket(String),
+
+    #[error("Failed to get relays status")]
+    UnableToGetRelaysStatus,
 }
 
 #[derive(Error, Debug)]

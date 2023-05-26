@@ -4,5 +4,7 @@ mod stats;
 mod utils;
 
 pub use error::Error;
-pub use state_machine::{NotificationEvent, RelayOptions, RelayPool, RelayState, RelayStatus};
+pub use state_machine::{
+    NotificationEvent, RelayOptions, RelayPool, RelayState, RelayStatus, RelayStatusList,
+};
 pub use stats::RelayConnectionStats;

@@ -22,12 +22,29 @@ use crate::utils::ConnResult;
 use crate::Error;
 use crate::RelayConnectionStats;
 
+#[derive(Debug, Clone)]
+pub struct RelayListener {
+    relay_tx: mpsc::Sender<RelayInput>,
+    status: RelayStatus,
+}
+impl RelayListener {
+    pub fn new(relay_tx: mpsc::Sender<RelayInput>) -> Self {
+        Self {
+            relay_tx,
+            status: RelayStatus::default(),
+        }
+    }
+    pub fn update_status(&mut self, status: RelayStatus) {
+        self.status = status;
+    }
+}
+
 pub struct RelayPoolTask {
     outside_rx: mpsc::UnboundedReceiver<PoolInput>,
     notification_sender: broadcast::Sender<NotificationEvent>,
     to_pool_tx: mpsc::Sender<RelayToPool>,
     to_pool_rx: mpsc::Receiver<RelayToPool>,
-    relays: HashMap<Url, mpsc::Sender<RelayInput>>,
+    relays: HashMap<Url, RelayListener>,
     subscriptions: HashMap<SubscriptionId, Vec<Filter>>,
 }
 impl RelayPoolTask {
@@ -47,36 +64,80 @@ impl RelayPoolTask {
             subscriptions,
         }
     }
+    fn handle_relay_to_pool(&mut self, msg: RelayToPool) -> Option<NotificationEvent> {
+        match msg.event {
+            RelayToPoolEvent::ConnectedToSocket => {
+                log::info!("{} - Connected to socket", &msg.url);
+
+                if let Some(listener) = self.relays.get_mut(&msg.url) {
+                    listener.update_status(RelayStatus::Connected);
+                    for (sub_id, filters) in &self.subscriptions {
+                        let relay_tx_1 = listener.relay_tx.clone();
+                        let sub_id_1 = sub_id.clone();
+                        let filters_1 = filters.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = relay_tx_1
+                                .send(RelayInput::Subscribe((sub_id_1, filters_1)))
+                                .await
+                            {
+                                log::debug!("relay dropped: {}", e);
+                            }
+                        });
+                    }
+                }
+
+                None
+            }
+            RelayToPoolEvent::Reconnecting => {
+                if let Some(listener) = self.relays.get_mut(&msg.url) {
+                    listener.update_status(RelayStatus::Connecting);
+                }
+                None
+            }
+            RelayToPoolEvent::FailedToConnect => {
+                if let Some(listener) = self.relays.get_mut(&msg.url) {
+                    listener.update_status(RelayStatus::Disconnected);
+                }
+                None
+            }
+            RelayToPoolEvent::RelayDisconnected => {
+                if let Some(listener) = self.relays.get_mut(&msg.url) {
+                    listener.update_status(RelayStatus::Disconnected);
+                }
+                None
+            }
+            RelayToPoolEvent::AttempToConnect => {
+                if let Some(listener) = self.relays.get_mut(&msg.url) {
+                    listener.update_status(RelayStatus::Connecting);
+                }
+                None
+            }
+            RelayToPoolEvent::MaxAttempsExceeded => {
+                if let Some(listener) = self.relays.get_mut(&msg.url) {
+                    listener.update_status(RelayStatus::Terminated);
+                }
+                Some(NotificationEvent::RelayTerminated(msg.url.clone()))
+            }
+            RelayToPoolEvent::TerminateRelay => {
+                if let Some(listener) = self.relays.get_mut(&msg.url) {
+                    listener.update_status(RelayStatus::Terminated);
+                }
+                Some(NotificationEvent::RelayTerminated(msg.url.clone()))
+            }
+            RelayToPoolEvent::Closed => {
+                if let Some(listener) = self.relays.get_mut(&msg.url) {
+                    listener.update_status(RelayStatus::Terminated);
+                }
+                None
+            }
+        }
+    }
     pub async fn run(&mut self) {
         loop {
             let event_opt = tokio::select! {
                 relay_input = self.to_pool_rx.recv() => {
                     if let Some(msg) = relay_input {
-                        match msg.event {
-                            RelayToPoolEvent::ConnectedToSocket => {
-                                log::info!("{} - Connected to socket", &msg.url);
-                                for (sub_id, filters) in &self.subscriptions {
-                                    if let Some(relay_tx) = self.relays.get_mut(&msg.url) {
-                                        let relay_tx_1 = relay_tx.clone();
-                                        let sub_id_1 = sub_id.clone();
-                                        let filters_1 = filters.clone();
-                                        tokio::spawn(async move {
-                                            if let Err(e) = relay_tx_1.send(RelayInput::Subscribe((sub_id_1, filters_1))).await {
-                                                log::debug!("relay dropped: {}", e);
-                                            }
-                                        });
-                                    }
-                                }
-                                None
-                            },
-                            RelayToPoolEvent::Reconnecting => None,
-                            RelayToPoolEvent::FailedToConnect => None,
-                            RelayToPoolEvent::RelayDisconnected => None,
-                            RelayToPoolEvent::AttempToConnect => None,
-                            RelayToPoolEvent::MaxAttempsExceeded => Some(NotificationEvent::RelayTerminated(msg.url.clone())),
-                            RelayToPoolEvent::TerminateRelay => Some(NotificationEvent::RelayTerminated(msg.url.clone())),
-                            RelayToPoolEvent::Closed => None,
-                        }
+                        self.handle_relay_to_pool(msg)
                     } else {
                         log::debug!("Relay pool task channel closed");
                         None
@@ -86,8 +147,8 @@ impl RelayPoolTask {
                     if let Some(input) = pool_input {
                         match input {
                             PoolInput::Shutdown => {
-                                for (_url, relay_tx) in &mut self.relays{
-                                    if let Err(e) = relay_tx.send(RelayInput::Close).await {
+                                for (_url, listener) in &mut self.relays{
+                                    if let Err(e) = listener.relay_tx.send(RelayInput::Close).await {
                                         log::debug!("Failed to send close to relay: {}", e);
                                     }
                                 }
@@ -95,18 +156,20 @@ impl RelayPoolTask {
                             }
                             PoolInput::AddRelay((url, _opts)) => {
                                 // TODO: use opts
-                                process_add_relay(&self.to_pool_tx, &self.notification_sender, url, &mut self.relays).await
+                                process_add_relay(&self.to_pool_tx, &self.notification_sender, url, &mut self.relays).await;
+                                None
                             }
                             PoolInput::SendEvent(event) => {
-                                for (_url, relay_tx) in &mut self.relays{
-                                    if let Err(e) = relay_tx.send(RelayInput::SendEvent(event.clone())).await {
+                                for (_url, listener) in &mut self.relays{
+                                    if let Err(e) = listener.relay_tx.send(RelayInput::SendEvent(event.clone())).await {
                                         log::debug!("Failed to send event to relay: {}", e);
                                     }
                                 }
                                 None
                             }
                             PoolInput::ReconnectRelay(url) => {
-                                process_reconnect_relay(url, &mut self.relays).await
+                                process_reconnect_relay(url, &mut self.relays).await;
+                                None
                             }
                             PoolInput::AddSubscription((sub_id, filters)) => {
                                 // process_subscribe_all(sub_id, filters, &mut self.relays).await
@@ -114,8 +177,8 @@ impl RelayPoolTask {
                                 None
                             }
                             PoolInput::RemoveRelay(url) => {
-                                if let Some(relay_tx) = &mut self.relays.get_mut(&url) {
-                                    if let Err(e) = relay_tx.send(RelayInput::Close).await{
+                                if let Some(listener) = &mut self.relays.get_mut(&url) {
+                                    if let Err(e) = listener.relay_tx.send(RelayInput::Close).await {
                                         log::debug!("Failed to send event to relay: {}", e);
                                     }
                                 }
@@ -127,6 +190,13 @@ impl RelayPoolTask {
                             }
                             PoolInput::ToggleWriteFor((url, write)) => {
                                 todo!()
+                            }
+                            PoolInput::GetRelayStatusList(one_tx) => {
+                                let status:RelayStatusList = self.relays.iter().map(|(url, listener)| (url.clone(), listener.status)).collect();
+                                if let Err(e) = one_tx.send(status).await {
+                                    log::debug!("Failed to send relays status: {}", e);
+                                }
+                                None
                             }
                         }
                     } else {
@@ -162,6 +232,7 @@ impl RelayOptions {
         Self { read, write }
     }
 }
+#[derive(Debug, Clone)]
 pub struct RelayPool {
     notification_sender: broadcast::Sender<NotificationEvent>,
     outside_tx: mpsc::UnboundedSender<PoolInput>,
@@ -257,7 +328,24 @@ impl RelayPool {
             .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
         Ok(())
     }
+    pub async fn relay_status_list(&self) -> Result<RelayStatusList, Error> {
+        log::info!("relays status list");
+        let (tx, mut rx) = mpsc::channel(1);
+        let msg = PoolInput::GetRelayStatusList(tx);
+
+        self.outside_tx
+            .send(msg.clone())
+            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+
+        if let Some(list) = rx.recv().await {
+            Ok(list)
+        } else {
+            Err(Error::UnableToGetRelaysStatus)
+        }
+    }
 }
+
+pub type RelayStatusList = Vec<(Url, RelayStatus)>;
 
 #[derive(Debug, Clone)]
 pub enum PoolInput {
@@ -269,11 +357,7 @@ pub enum PoolInput {
     RemoveRelay(Url),
     ToggleReadFor((Url, bool)),
     ToggleWriteFor((Url, bool)),
-    // AddSubscriptionTo {
-    //     subscription_id: SubscriptionId,
-    //     url: Url,
-    //     filters: Vec<Filter>,
-    // },
+    GetRelayStatusList(mpsc::Sender<RelayStatusList>),
 }
 #[derive(Debug, Clone)]
 pub enum NotificationEvent {
@@ -327,7 +411,7 @@ impl std::fmt::Display for RelayState {
         }
     }
 }
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum RelayStatus {
     #[default]
     Disconnected,
@@ -738,8 +822,8 @@ async fn process_add_relay(
     to_pool_sender: &mpsc::Sender<RelayToPool>,
     pool_event_sender: &broadcast::Sender<NotificationEvent>,
     url: Url,
-    relays: &mut HashMap<Url, mpsc::Sender<RelayInput>>,
-) -> Option<NotificationEvent> {
+    relays: &mut HashMap<Url, RelayListener>,
+) {
     let (relay_input_sender, relay_input_receiver) = mpsc::channel(RELAY_INPUT_CHANNEL_SIZE);
     let relay_task = spawn_relay_task(
         url.clone(),
@@ -749,23 +833,17 @@ async fn process_add_relay(
         pool_event_sender.clone(),
     );
     tokio::spawn(relay_task);
-    relays.insert(url.clone(), relay_input_sender);
-    // Some(NotificationEvent::RelayAdded(url))
-    None
+    relays.insert(url.clone(), RelayListener::new(relay_input_sender));
 }
 
-async fn process_reconnect_relay(
-    url: Url,
-    relays: &mut HashMap<Url, mpsc::Sender<RelayInput>>,
-) -> Option<NotificationEvent> {
-    if let Some(relay_tx) = relays.get_mut(&url) {
-        if let Err(e) = relay_tx.try_send(RelayInput::Reconnect) {
+async fn process_reconnect_relay(url: Url, relays: &mut HashMap<Url, RelayListener>) {
+    if let Some(listener) = relays.get_mut(&url) {
+        if let Err(e) = listener.relay_tx.try_send(RelayInput::Reconnect) {
             log::debug!("Failed to send reconnect to relay: {}", e);
         }
     } else {
         log::warn!("Relay not found");
     }
-    None
 }
 
 // async fn process_subscribe_to(

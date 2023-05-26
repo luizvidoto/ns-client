@@ -45,10 +45,10 @@ async fn main() -> Result<(), anyhow::Error> {
             .wait_for_subscription(false),
     );
 
-    let mut relay_servers = (100..150)
+    let mut relay_servers = (15..16)
         .flat_map(|n| {
-            (10..20)
-                .map(|m| format!("ws://192.168.{}.{}:8080", m, n))
+            (119..120)
+                .map(|m| format!("ws://192.168.{}.{}:8080", n, m))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
