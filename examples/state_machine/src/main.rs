@@ -1,13 +1,12 @@
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, path::Path};
 
 use log::debug;
 use nostr::RelayMessage;
-
-const ACC_1: &'static str = "4510459b74db68371be462f19ef4f7ef1e6c5a95b1d83a7adf00987c51ac56fe";
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncWriteExt, BufWriter},
+    sync::mpsc,
+};
 
 pub(crate) const RELAY_SUGGESTIONS: [&'static str; 16] = [
     "wss://relay.plebstr.com",
@@ -32,25 +31,25 @@ pub(crate) const RELAY_SUGGESTIONS: [&'static str; 16] = [
 async fn main() {
     env_logger::init();
     // Create a new instance of Instant, which marks the current point in time.
-    let start = Instant::now();
-
-    let mut events: HashMap<nostr::Url, (nostr::SubscriptionId, Vec<nostr::Event>)> =
-        HashMap::new();
-
-    let secret_key = nostr::secp256k1::SecretKey::from_str(ACC_1).expect("Invalid secret key");
-    let keys = nostr::Keys::new(secret_key);
-    let public_key = keys.public_key();
+    // let start = Instant::now();
 
     let pool = ns_client::RelayPool::new();
     let mut notifications = pool.notifications();
     println!("APP: Connecting to pool");
 
-    let meta_filter = nostr::Filter::new().kinds(vec![nostr::Kind::Metadata]);
-    let sent_msgs_sub_past = nostr::Filter::new()
-        .kinds(nostr_kinds())
-        .author(public_key.to_string());
-    let recv_msgs_sub_past = nostr::Filter::new().kinds(nostr_kinds()).pubkey(public_key);
-    if let Err(e) = pool.subscribe(vec![meta_filter, sent_msgs_sub_past, recv_msgs_sub_past]) {
+    // let meta_filter = nostr::Filter::new().kinds(vec![nostr::Kind::Metadata]);
+    // let sent_msgs_sub_past = nostr::Filter::new()
+    //     .kinds(nostr_kinds())
+    //     .author(public_key.to_string());
+    // let recv_msgs_sub_past = nostr::Filter::new().kinds(nostr_kinds()).pubkey(public_key);
+    let channel_filter = nostr::Filter::new()
+        .kinds(vec![
+            nostr::Kind::ChannelCreation,
+            nostr::Kind::ChannelMetadata,
+        ])
+        .limit(CHANNEL_SEARCH_LIMIT);
+
+    if let Err(e) = pool.subscribe(vec![channel_filter]) {
         log::error!("Failed to subscribe to metadata: {}", e);
     }
 
@@ -81,21 +80,17 @@ async fn main() {
 
     let mut terminated_relays: HashSet<String> = HashSet::new();
 
-    let pool_1 = pool.clone();
+    let (tx, rx) = mpsc::channel(100);
+    let file_path = Path::new("output.json");
     tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Ok(status) = pool_1.relay_status_list().await {
-                for (url, status) in status.iter() {
-                    println!("APP: {}: {}", url, status)
-                }
-            }
+        if let Err(e) = receive_and_write(rx, &file_path).await {
+            eprintln!("An error occurred while writing to the file: {}", e);
         }
     });
 
     while let Ok(event) = notifications.recv().await {
         match event {
-            ns_client::NotificationEvent::SentEvent((url, event_id)) => {
+            ns_client::NotificationEvent::SentEvent(url, event_id) => {
                 debug!("APP: Sent event: {} - {}", url, &event_id);
             }
             ns_client::NotificationEvent::RelayTerminated(url) => {
@@ -108,41 +103,30 @@ async fn main() {
                     }
                 })
             }
-            ns_client::NotificationEvent::RelayMessage((url, message)) => {
+            ns_client::NotificationEvent::RelayMessage(url, message) => {
                 match message {
                     RelayMessage::Event {
-                        subscription_id,
+                        subscription_id: _,
                         event,
                     } => {
-                        if let Some((_sub_id, sub)) = events.get_mut(&url) {
-                            sub.push(*event);
-                        } else {
-                            events.insert(url, (subscription_id, vec![*event]));
+                        // if let Some((_sub_id, sub)) = events.get_mut(&url) {
+                        //     sub.push(*event);
+                        // } else {
+                        //     events.insert(url, (subscription_id, vec![*event]));
+                        // }
+                        if let Err(e) = tx.send(*event).await {
+                            eprintln!("An error occurred while sending the event: {}", e);
                         }
                     }
                     RelayMessage::EndOfStoredEvents(sub_id) => {
                         println!("APP: END OF STORED EVENTS. ID: {}", sub_id);
-
-                        for (url, (sub, events)) in events.iter() {
-                            println!("APP: events. {} - ID: {} - {}", &url, sub, events.len());
-                        }
-
-                        // Get the time elapsed since the creation of the Instant.
-                        // let duration = start.elapsed();
-
-                        // Display the elapsed time.
-                        // println!(
-                        //     "APP: Time elapsed in expensive_function() is: {:?}",
-                        //     duration
-                        // );
-                        // break;
                     }
                     other => {
                         debug!("APP: Relay message: {} - {:?}", url, other);
                     }
                 }
             }
-            ns_client::NotificationEvent::SentSubscription((url, sub_id)) => {
+            ns_client::NotificationEvent::SentSubscription(url, sub_id) => {
                 debug!("APP: Sent subscription: {} - {:?}", url, sub_id);
             } // ns_client::PoolEvent::None => (),
         }
@@ -160,3 +144,50 @@ pub fn nostr_kinds() -> Vec<nostr::Kind> {
     ]
     .to_vec()
 }
+
+// async fn receive_and_write(
+//     mut receiver: mpsc::Receiver<nostr::Event>,
+//     file_path: &Path,
+// ) -> Result<(), Box<dyn std::error::Error>> {
+//     let mut file = tokio::fs::File::create(file_path).await?;
+
+//     while let Some(data) = receiver.recv().await {
+//         let json = serde_json::to_string(&data)?;
+//         file.write_all(json.as_bytes()).await?;
+//     }
+
+//     Ok(())
+// }
+
+async fn receive_and_write(
+    mut receiver: mpsc::Receiver<nostr::Event>,
+    file_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(file_path)
+        .await?;
+
+    let mut writer = BufWriter::new(file);
+
+    let mut first = true;
+
+    while let Some(data) = receiver.recv().await {
+        let json = if first {
+            first = false;
+            format!("[\n{}\n", serde_json::to_string(&data)?)
+        } else {
+            format!(",{}\n", serde_json::to_string(&data)?)
+        };
+
+        writer.write_all(json.as_bytes()).await?;
+    }
+
+    writer.write_all(b"]").await?;
+
+    Ok(())
+}
+
+const CHANNEL_SEARCH_LIMIT: usize = 100;

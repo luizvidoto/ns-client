@@ -1,10 +1,12 @@
 mod error;
-mod state_machine;
+mod pool;
+mod relay;
 mod stats;
 mod utils;
 
 pub use error::Error;
-pub use state_machine::{
-    NotificationEvent, RelayOptions, RelayPool, RelayState, RelayStatus, RelayStatusList,
-};
+pub use pool::{NotificationEvent, RelayPool, RelayStatusList};
+pub use relay::{RelayOptions, RelayState, RelayStatus};
 pub use stats::RelayConnectionStats;
+
+pub type Result<T> = std::result::Result<T, Error>;
