@@ -1,19 +1,23 @@
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, path::Path, str::FromStr, time::Duration};
 
 use log::debug;
-use nostr::{RelayMessage, SubscriptionId};
+use nostr::{
+    nips::nip21::NostrURI,
+    prelude::{FromBech32, FromPkStr, FromSkStr},
+    ChannelId, EventId, Keys, RelayMessage, SubscriptionId, Tag, Url,
+};
 use tokio::{
     fs::OpenOptions,
     io::{AsyncWriteExt, BufWriter},
     sync::mpsc,
 };
 
-pub(crate) const RELAY_SUGGESTIONS: [&'static str; 0] = [
-    // "wss://relay.plebstr.com",
+pub(crate) const RELAY_SUGGESTIONS: [&'static str; 3] = [
+    "wss://relay.plebstr.com",
+    "wss://relay.snort.social",
+    "wss://relay.damus.io",
     // "wss://nostr.wine",
-    // "wss://relay.snort.social",
     // "wss://nostr-pub.wellorder.net",
-    // "wss://relay.damus.io",
     // "wss://nostr1.tunnelsats.com",
     // "wss://relay.nostr.info",
     // "wss://nostr-relay.wlvs.space",
@@ -55,28 +59,65 @@ async fn main() {
 
     let pool = ns_client::RelayPool::new();
     let mut notifications = pool.notifications();
-    println!("APP: Connecting to pool");
+    log::info!("APP: Connecting to pool");
 
     // let meta_filter = nostr::Filter::new().kinds(vec![nostr::Kind::Metadata]);
     // let sent_msgs_sub_past = nostr::Filter::new()
     //     .kinds(nostr_kinds())
     //     .author(public_key.to_string());
     // let recv_msgs_sub_past = nostr::Filter::new().kinds(nostr_kinds()).pubkey(public_key);
-    let channel_creation = nostr::Filter::new()
+    // let src_channel_id_1 =
+    //     EventId::from_str("f23e652ffda1871d71cd5e1fd6a1f7cc6ef3b42415551814c5a025b68f5bf174")
+    //         .unwrap();
+    // let src_channel_id_2 =
+    //     EventId::from_str("5d7807b7476b78bbb53f9c97aa90b45e44a56f0a709460320e1b6c1a5b16a364")
+    //         .unwrap();
+
+    let cars_channel =
+        EventId::from_hex("8233a5d8e27a9415d22c974d70935011664ada55ae3152bd10d697d3a3c74f67")
+            .unwrap();
+    let creation_filter = nostr::Filter::new()
         .kind(nostr::Kind::ChannelCreation)
+        // .id(cars_channel)
         .limit(CHANNEL_SEARCH_LIMIT);
-    let channel_id = SubscriptionId::new(SubscriptionType::Channel.to_string());
-    if let Err(e) = pool.subscribe_eose(&channel_id, vec![channel_creation]) {
-        log::error!("Failed to subscribe to metadata: {}", e);
+    let metadata_filter = nostr::Filter::new()
+        .kind(nostr::Kind::ChannelMetadata)
+        // .event(cars_channel)
+        .limit(CHANNEL_SEARCH_LIMIT);
+    let messages_filter = nostr::Filter::new()
+        .kind(nostr::Kind::ChannelMessage)
+        // .event(cars_channel)
+        .limit(CHANNEL_SEARCH_LIMIT);
+    let hide_msgs_filter = nostr::Filter::new()
+        .kind(nostr::Kind::ChannelHideMessage)
+        // .event(cars_channel)
+        .limit(CHANNEL_SEARCH_LIMIT);
+    let mute_filter = nostr::Filter::new()
+        .kind(nostr::Kind::ChannelMuteUser)
+        // .event(cars_channel)
+        .limit(CHANNEL_SEARCH_LIMIT);
+
+    if let Err(e) = pool.subscribe_eose(
+        &SubscriptionId::new(SubscriptionType::Channel.to_string()),
+        vec![
+            creation_filter,
+            metadata_filter,
+            messages_filter,
+            hide_msgs_filter,
+            mute_filter,
+        ],
+        Some(Duration::from_secs(3)),
+    ) {
+        log::error!("Failed to subscribe: {}", e);
     }
 
-    let contact_list_id = SubscriptionId::new(SubscriptionType::ContactList.to_string());
-    let contact_list = nostr::Filter::new()
-        .kind(nostr::Kind::ContactList)
-        .limit(CHANNEL_SEARCH_LIMIT);
-    if let Err(e) = pool.subscribe_eose(&contact_list_id, vec![contact_list]) {
-        log::error!("Failed to subscribe to contact_list: {}", e);
-    }
+    // let contact_list_id = SubscriptionId::new(SubscriptionType::ContactList.to_string());
+    // let contact_list = nostr::Filter::new()
+    //     .kind(nostr::Kind::ContactList)
+    //     .limit(CHANNEL_SEARCH_LIMIT);
+    // if let Err(e) = pool.subscribe_eose(&contact_list_id, vec![contact_list]) {
+    //     log::error!("Failed to subscribe to contact_list: {}", e);
+    // }
 
     let mut relay_servers = (15..16)
         .flat_map(|n| {
@@ -101,89 +142,78 @@ async fn main() {
         }
     }
 
-    println!("APP: Relays: {}", relay_servers.len());
+    log::info!("APP: Relays: {}", relay_servers.len());
 
-    let mut terminated_relays: HashSet<String> = HashSet::new();
+    // let mut terminated_relays: HashSet<String> = HashSet::new();
 
     let (tx, rx) = mpsc::channel(100);
     let file_path = Path::new("output.json");
     tokio::spawn(async move {
-        if let Err(e) = receive_and_write(rx, &file_path).await {
-            eprintln!("An error occurred while writing to the file: {}", e);
-        }
-    });
-
-    while let Ok(event) = notifications.recv().await {
-        match event {
-            ns_client::NotificationEvent::SentEvent(url, event_id) => {
-                debug!("APP: Sent event: {} - {}", url, &event_id);
-            }
-            ns_client::NotificationEvent::RelayTerminated(url) => {
-                debug!("APP: relay terminated: {}", &url);
-                terminated_relays.insert(url.to_string());
-                RELAY_SUGGESTIONS.iter().for_each(|r| {
-                    if terminated_relays.contains(&r.to_string()) {
-                        println!("APP: Terminated relays: {}", terminated_relays.len());
-                        println!("APP: relay terminated: {}", &r);
-                    }
-                })
-            }
-            ns_client::NotificationEvent::RelayMessage(url, message) => {
-                match message {
+        let mut acc = 0;
+        while let Ok(event) = notifications.recv().await {
+            match event {
+                ns_client::NotificationEvent::Timeout(url, sub_id) => {
+                    log::info!("APP: Timeout: {} - {}", url, sub_id);
+                    acc += 1;
+                }
+                ns_client::NotificationEvent::SentEvent(url, event_id) => {
+                    log::info!("APP: Sent event: {} - {}", url, &event_id);
+                }
+                ns_client::NotificationEvent::RelayTerminated(url) => {
+                    log::info!("APP: relay terminated: {}", &url);
+                }
+                ns_client::NotificationEvent::RelayMessage(url, message) => match message {
                     RelayMessage::Event {
                         subscription_id: _,
                         event,
                     } => {
-                        // if let Some((_sub_id, sub)) = events.get_mut(&url) {
-                        //     sub.push(*event);
-                        // } else {
-                        //     events.insert(url, (subscription_id, vec![*event]));
-                        // }
-                        if let Err(e) = tx.send(*event).await {
-                            eprintln!("An error occurred while sending the event: {}", e);
+                        if let Err(e) = tx.send(event.as_json()).await {
+                            log::error!("An error occurred while sending the event: {}", e);
                         }
                     }
                     RelayMessage::EndOfStoredEvents(sub_id) => {
-                        println!("APP: END OF STORED EVENTS. ID: {} - {}", &url, sub_id);
-                        if sub_id.to_string() == SubscriptionType::Channel.to_string() {
-                            let id =
-                                SubscriptionId::new(SubscriptionType::ChannelMetadata.to_string());
-                            let channel_metadata = nostr::Filter::new()
-                                .kind(nostr::Kind::ChannelMetadata)
-                                .limit(CHANNEL_SEARCH_LIMIT);
-                            if let Err(e) =
-                                pool.relay_subscribe_eose(&url, &id, vec![channel_metadata])
-                            {
-                                log::error!("Failed to subscribe to metadata: {}", e);
-                            }
-                        }
-
-                        if sub_id.to_string() == SubscriptionType::ContactList.to_string() {
-                            let id = SubscriptionId::new(
-                                SubscriptionType::ContactListMetadata.to_string(),
-                            );
-                            let channel_metadata = nostr::Filter::new()
-                                .kind(nostr::Kind::Metadata)
-                                .limit(CHANNEL_SEARCH_LIMIT);
-                            if let Err(e) =
-                                pool.relay_subscribe_eose(&url, &id, vec![channel_metadata])
-                            {
-                                log::error!("Failed to subscribe to metadata: {}", e);
-                            }
-                        }
+                        log::info!("APP: END OF STORED EVENTS. ID: {} - {}", &url, sub_id);
+                        acc += 1;
                     }
                     other => {
                         debug!("APP: Relay message: {} - {:?}", url, other);
                     }
+                },
+                ns_client::NotificationEvent::SentSubscription(url, sub_id) => {
+                    log::info!("APP: Sent subscription: {} - {:?}", url, sub_id);
                 }
             }
-            ns_client::NotificationEvent::SentSubscription(url, sub_id) => {
-                debug!("APP: Sent subscription: {} - {:?}", url, sub_id);
-            } // ns_client::PoolEvent::None => (),
+
+            if acc == 3 {
+                if let Err(e) = tx.send("END".to_string()).await {
+                    log::error!("An error occurred while sending the event: {}", e);
+                }
+            };
         }
+    });
+
+    // tokio::spawn(async move {
+    // });
+    tokio::fs::remove_file(file_path).await.unwrap();
+    if let Err(e) = receive_and_write(rx, &file_path).await {
+        log::error!("An error occurred while writing to the file: {}", e);
     }
 
-    println!("APP: Done");
+    // let cars_channel =
+    //     ChannelId::from_hex("8233a5d8e27a9415d22c974d70935011664ada55ae3152bd10d697d3a3c74f67")
+    //         .unwrap();
+    // let keys =
+    //     Keys::from_sk_str("4510459b74db68371be462f19ef4f7ef1e6c5a95b1d83a7adf00987c51ac56fe")
+    //         .unwrap();
+    // let my_relay = Url::parse("ws://192.168.15.119:8080").unwrap();
+    // let event = nostr::EventBuilder::new_channel_msg(cars_channel, my_relay, "eai amigos")
+    //     .to_event(&keys)
+    //     .unwrap();
+    // pool.send_event(event).unwrap();
+
+    // tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    log::info!("APP: Done");
 }
 
 pub fn nostr_kinds() -> Vec<nostr::Kind> {
@@ -195,50 +225,45 @@ pub fn nostr_kinds() -> Vec<nostr::Kind> {
     ]
     .to_vec()
 }
-
-// async fn receive_and_write(
-//     mut receiver: mpsc::Receiver<nostr::Event>,
-//     file_path: &Path,
-// ) -> Result<(), Box<dyn std::error::Error>> {
-//     let mut file = tokio::fs::File::create(file_path).await?;
-
-//     while let Some(data) = receiver.recv().await {
-//         let json = serde_json::to_string(&data)?;
-//         file.write_all(json.as_bytes()).await?;
-//     }
-
-//     Ok(())
-// }
-
 async fn receive_and_write(
-    mut receiver: mpsc::Receiver<nostr::Event>,
+    mut receiver: mpsc::Receiver<String>,
     file_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
-        .append(true)
         .open(file_path)
         .await?;
+
+    log::info!("APP: Writing to file: {:?}", file_path);
 
     let mut writer = BufWriter::new(file);
 
     let mut first = true;
 
     while let Some(data) = receiver.recv().await {
+        if data == "END" {
+            // Write the closing bracket and break the loop
+            writer.write_all(b"]").await?;
+            break;
+        }
+
         let json = if first {
             first = false;
-            format!("[\n{}\n", serde_json::to_string(&data)?)
+            format!("[\n{}\n", data)
         } else {
-            format!(",{}\n", serde_json::to_string(&data)?)
+            format!(",{}\n", data)
         };
 
-        writer.write_all(json.as_bytes()).await?;
+        if let Err(e) = writer.write_all(json.as_bytes()).await {
+            log::error!("An error occurred while writing to the file: {}", e);
+            break;
+        }
     }
 
-    writer.write_all(b"]").await?;
+    writer.flush().await?;
 
     Ok(())
 }
 
-const CHANNEL_SEARCH_LIMIT: usize = 100;
+const CHANNEL_SEARCH_LIMIT: usize = 1000;

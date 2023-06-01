@@ -4,7 +4,6 @@ use futures_util::stream::SplitSink;
 use futures_util::stream::SplitStream;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
-use log::info;
 use nostr::ClientMessage;
 use nostr::Filter;
 use nostr::RelayMessage;
@@ -13,7 +12,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio::sync::futures;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::error::Error as WsError;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -73,6 +71,7 @@ pub async fn spawn_relay_task(
                     let event = notification_event.to_event(&url);
 
                     check_subscription_eose(&event, &relay, &relay_input_sender);
+                    check_timeout(&event, &relay, &relay_input_sender);
 
                     if notification_sender.send(event).is_err() {
                         log::debug!("Failed to send event to notification receiver.");
@@ -92,11 +91,28 @@ fn check_subscription_eose(
         if let Some(subscription) = relay.subscriptions.get(sub_id) {
             if let SubscriptionType::UntilEOSE = subscription.sub_type {
                 if relay_input_sender
-                    .try_send(RelayInput::EndEOSESubscription(sub_id.to_owned()))
+                    .try_send(RelayInput::CloseSubscription(sub_id.to_owned()))
                     .is_err()
                 {
-                    log::debug!("Failed to send EndEOSESubscription signal to relay.");
+                    log::debug!("Failed to send CloseSubscription signal to relay.");
                 }
+            }
+        }
+    }
+}
+
+fn check_timeout(
+    event: &NotificationEvent,
+    relay: &Relay,
+    relay_input_sender: &mpsc::Sender<RelayInput>,
+) {
+    if let NotificationEvent::Timeout(_, sub_id) = event {
+        if let Some(subscription) = relay.subscriptions.get(sub_id) {
+            if relay_input_sender
+                .try_send(RelayInput::CloseSubscription(sub_id.to_owned()))
+                .is_err()
+            {
+                log::debug!("Failed to send CloseSubscription signal to relay.");
             }
         }
     }
@@ -109,6 +125,8 @@ pub struct Relay {
     write: bool,
     relay_input_receiver: mpsc::Receiver<RelayInput>,
     subscriptions: HashMap<SubscriptionId, Subscription>,
+    timeout_tx: mpsc::Sender<SubscriptionId>,
+    timeout_rx: mpsc::Receiver<SubscriptionId>,
 }
 impl Relay {
     fn new(
@@ -116,6 +134,7 @@ impl Relay {
         relay_input_receiver: mpsc::Receiver<RelayInput>,
         opts: RelayOptions,
     ) -> Self {
+        let (timeout_tx, timeout_rx) = mpsc::channel(10);
         Self {
             relay_input_receiver,
             stats: RelayConnectionStats::new(),
@@ -123,7 +142,108 @@ impl Relay {
             subscriptions: HashMap::new(),
             read: opts.read,
             write: opts.write,
+            timeout_rx,
+            timeout_tx,
         }
+    }
+    async fn handle_input(
+        &mut self,
+        ws_write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        input: RelayInput,
+    ) -> Result<Option<RelayEvent>, Error> {
+        match input {
+            RelayInput::ToggleRead(read) => {
+                self.read = read;
+                Ok(None)
+            }
+            RelayInput::ToggleWrite(write) => {
+                self.write = write;
+                Ok(None)
+            }
+            RelayInput::CloseSubscription(sub_id) => {
+                log::debug!("Sending close subscription");
+                let msg = ClientMessage::close(sub_id.clone());
+                log::debug!("{}", msg.as_json());
+                self.send_ws(ws_write, msg).await?;
+                log::debug!("Sent close subscription");
+
+                self.subscriptions.remove(&sub_id);
+
+                Ok(None)
+            }
+            RelayInput::SendEvent(event) => {
+                log::debug!("Sending event");
+                let event_id = event.id;
+                let msg = ClientMessage::new_event(event);
+                log::debug!("{}", msg.as_json());
+                self.send_ws(ws_write, msg).await?;
+                log::debug!("Sent event");
+                Ok(Some(RelayEvent::RelayNotification(
+                    RelayNotificationEvent::SentEvent(event_id),
+                )))
+            }
+            RelayInput::Subscribe(subscription) => {
+                log::debug!("Sending subscription request");
+                if self.subscriptions.contains_key(&subscription.id) {
+                    log::info!("Already sent subscription");
+                    return Ok(None);
+                }
+
+                let sub_id = subscription.id.clone();
+                let timeout_sender = self.timeout_tx.clone();
+                if let Some(timeout) = subscription.timeout {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(timeout).await;
+                        let _ = timeout_sender.send(sub_id).await;
+                    });
+                }
+
+                let sub_id = subscription.id.clone();
+                let msg = ClientMessage::new_req(sub_id.clone(), subscription.filters.clone());
+
+                log::debug!("{}", msg.as_json());
+
+                self.send_ws(ws_write, msg).await?;
+
+                self.subscriptions.insert(sub_id.clone(), subscription);
+
+                Ok(Some(RelayEvent::RelayNotification(
+                    RelayNotificationEvent::SentSubscription(sub_id),
+                )))
+            }
+            RelayInput::Count(subscription) => {
+                log::debug!("Sending count request");
+                let msg = ClientMessage::new_count(subscription.id.clone(), subscription.filters);
+                log::debug!("{}", msg.as_json());
+                self.send_ws(ws_write, msg).await?;
+                log::debug!("Sent count request");
+                Ok(None)
+            }
+            RelayInput::Close => {
+                log::debug!("Closing relay");
+                let _ = ws_write.close().await;
+                Ok(Some(RelayEvent::RelayToPool(RelayToPoolEvent::Closed)))
+            }
+            RelayInput::Reconnect => {
+                log::debug!("Ignoring reconnect request");
+                Ok(None)
+            }
+        }
+    }
+
+    async fn send_ws(
+        &self,
+        ws_write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        msg: ClientMessage,
+    ) -> Result<(), Error> {
+        if !self.write {
+            return Err(Error::BlockedWriteToRelay(self.url.to_owned()));
+        }
+        ws_write
+            .send(Message::text(msg.as_json()))
+            .await
+            .map_err(|e| Error::FailedToSendToSocket(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -242,95 +362,6 @@ fn handle_ws_message(url: &Url, message: Option<Result<Message, WsError>>) -> Op
     }
 }
 
-async fn handle_relay_input(
-    ws_write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    relay: &mut Relay,
-    input: RelayInput,
-) -> Result<Option<RelayEvent>, Error> {
-    match input {
-        RelayInput::ToggleRead(read) => {
-            relay.read = read;
-            Ok(None)
-        }
-        RelayInput::ToggleWrite(write) => {
-            relay.write = write;
-            Ok(None)
-        }
-        RelayInput::EndEOSESubscription(sub_id) => {
-            log::debug!("Sending close subscription");
-            let msg = ClientMessage::close(sub_id.clone());
-
-            send_ws(relay, ws_write, msg).await?;
-            log::debug!("Sent close subscription");
-
-            // instead of removing the subscription, we mark it as done
-            // can't resubscribe to the same subscription id
-            if let Some(sub) = relay.subscriptions.get_mut(&sub_id) {
-                sub.done();
-            } else {
-                log::error!("Subscription not found");
-            }
-
-            Ok(None)
-        }
-        RelayInput::SendEvent(event) => {
-            log::debug!("Sending event");
-            let event_id = event.id;
-            let msg = ClientMessage::new_event(event);
-            send_ws(relay, ws_write, msg).await?;
-            log::debug!("Sent event");
-            Ok(Some(RelayEvent::RelayNotification(
-                RelayNotificationEvent::SentEvent(event_id),
-            )))
-        }
-        RelayInput::Subscribe(subscription) => {
-            log::debug!("Sending subscription request");
-            if relay.subscriptions.contains_key(&subscription.id) {
-                log::info!("Already sent subscription");
-                return Ok(None);
-            }
-            let sub_id = subscription.id.clone();
-            let msg = ClientMessage::new_req(sub_id.clone(), subscription.filters.clone());
-            send_ws(relay, ws_write, msg).await?;
-            relay.subscriptions.insert(sub_id.clone(), subscription);
-            Ok(Some(RelayEvent::RelayNotification(
-                RelayNotificationEvent::SentSubscription(sub_id),
-            )))
-        }
-        RelayInput::Count(subscription) => {
-            log::debug!("Sending count request");
-            let msg = ClientMessage::new_count(subscription.id.clone(), subscription.filters);
-            send_ws(relay, ws_write, msg).await?;
-            log::debug!("Sent count request");
-            Ok(None)
-        }
-        RelayInput::Close => {
-            log::debug!("Closing relay");
-            let _ = ws_write.close().await;
-            Ok(Some(RelayEvent::RelayToPool(RelayToPoolEvent::Closed)))
-        }
-        RelayInput::Reconnect => {
-            log::debug!("Ignoring reconnect request");
-            Ok(None)
-        }
-    }
-}
-
-async fn send_ws(
-    relay: &Relay,
-    ws_write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    msg: ClientMessage,
-) -> Result<(), Error> {
-    if !relay.write {
-        return Err(Error::BlockedWriteToRelay(relay.url.to_owned()));
-    }
-    ws_write
-        .send(Message::text(msg.as_json()))
-        .await
-        .map_err(|e| Error::FailedToSendToSocket(e.to_string()))?;
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 pub enum RelayInput {
     ToggleRead(bool),
@@ -340,7 +371,7 @@ pub enum RelayInput {
     Close,
     Reconnect,
     Count(Subscription),
-    EndEOSESubscription(SubscriptionId),
+    CloseSubscription(SubscriptionId),
 }
 #[derive(Debug, Clone)]
 pub enum RelayEvent {
@@ -360,6 +391,7 @@ pub enum RelayToPoolEvent {
 }
 #[derive(Debug, Clone)]
 pub enum RelayNotificationEvent {
+    Timeout(SubscriptionId),
     RelayMessage(RelayMessage),
     SentSubscription(SubscriptionId),
     SentEvent(nostr::EventId),
@@ -375,6 +407,9 @@ impl RelayNotificationEvent {
             }
             RelayNotificationEvent::SentEvent(event_id) => {
                 NotificationEvent::SentEvent(url.to_owned(), event_id)
+            }
+            RelayNotificationEvent::Timeout(subscription_id) => {
+                NotificationEvent::Timeout(url.to_owned(), subscription_id)
             }
         }
     }
@@ -513,12 +548,25 @@ pub async fn run_relay(relay: &mut Relay, state: RelayState) -> (Option<RelayEve
                 }
                 input = relay.relay_input_receiver.recv() => {
                     if let Some(input) = input {
-                        match handle_relay_input(&mut ws_write, relay, input).await {
+                        match relay.handle_input(&mut ws_write, input).await {
                             Ok(event_opt) => event_opt,
                             Err(e) => {
                                 log::debug!("{}: {}", &relay.url, e);
                                 None
                             }
+                        }
+                    } else {
+                        log::debug!("{}: Relay input channel closed", &relay.url);
+                        None
+                    }
+                }
+                timeout = relay.timeout_rx.recv() => {
+                    if let Some(sub_id) = timeout {
+                        if relay.subscriptions.get(&sub_id).is_some() {
+                            log::debug!("{}: Timeout for subscription {}", &relay.url, sub_id);
+                            Some(RelayEvent::RelayNotification(RelayNotificationEvent::Timeout(sub_id)))
+                        } else {
+                            None
                         }
                     } else {
                         log::debug!("{}: Relay input channel closed", &relay.url);
@@ -568,6 +616,7 @@ pub struct Subscription {
     pub filters: Vec<Filter>,
     pub sub_type: SubscriptionType,
     pub status: SubscriptionStatus,
+    pub timeout: Option<Duration>,
 }
 impl Subscription {
     pub fn new(filters: Vec<Filter>, sub_type: SubscriptionType) -> Self {
@@ -576,10 +625,15 @@ impl Subscription {
             filters,
             sub_type,
             status: SubscriptionStatus::Active,
+            timeout: None,
         }
     }
     pub fn with_id(mut self, id: &SubscriptionId) -> Self {
         self.id = id.to_owned();
+        self
+    }
+    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
         self
     }
     pub fn done(&mut self) {
@@ -588,6 +642,7 @@ impl Subscription {
 }
 #[derive(Debug, Clone)]
 pub enum SubscriptionType {
+    Count,
     UntilEOSE,
     Endless,
 }

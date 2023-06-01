@@ -2,6 +2,7 @@ use nostr::Filter;
 use nostr::RelayMessage;
 use nostr::SubscriptionId;
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use url::Url;
 
@@ -66,10 +67,13 @@ impl RelayPoolTask {
                     for (_sub_id, subscription) in &self.subscriptions {
                         let relay_tx_1 = listener.relay_tx.clone();
                         let subscription = subscription.to_owned();
+                        let message = match subscription.sub_type {
+                            SubscriptionType::Count => RelayInput::Count(subscription),
+                            SubscriptionType::UntilEOSE => RelayInput::Subscribe(subscription),
+                            SubscriptionType::Endless => RelayInput::Subscribe(subscription),
+                        };
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                relay_tx_1.send(RelayInput::Subscribe(subscription)).await
-                            {
+                            if let Err(e) = relay_tx_1.send(message).await {
                                 log::debug!("relay dropped: {}", e);
                             }
                         });
@@ -158,6 +162,15 @@ impl RelayPoolTask {
                             }
                             PoolInput::ReconnectRelay(url) => {
                                 process_reconnect_relay(url, &mut self.relays).await;
+                                None
+                            }
+                            PoolInput::Count(subscription) => {
+                                self.subscriptions.insert(subscription.id.clone(), subscription.clone());
+                                for (_url, listener) in &mut self.relays {
+                                    if let Err(e) = listener.relay_tx.send(RelayInput::Count(subscription.clone())).await {
+                                        log::debug!("Failed to send Subscribe to relay: {}", e);
+                                    }
+                                }
                                 None
                             }
                             PoolInput::AddSubscription(subscription) => {
@@ -249,8 +262,12 @@ impl RelayPool {
     pub fn notifications(&self) -> broadcast::Receiver<NotificationEvent> {
         self.notification_sender.subscribe()
     }
-    pub fn subscribe(&self, filters: Vec<Filter>) -> Result<SubscriptionId, Error> {
-        let subscription = Subscription::new(filters, SubscriptionType::Endless);
+    pub fn subscribe(
+        &self,
+        filters: Vec<Filter>,
+        timeout: Option<Duration>,
+    ) -> Result<SubscriptionId, Error> {
+        let subscription = Subscription::new(filters, SubscriptionType::Endless).timeout(timeout);
         let sub_id = subscription.id.clone();
         let msg = PoolInput::AddSubscription(subscription);
         self.outside_tx
@@ -258,18 +275,47 @@ impl RelayPool {
             .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
         Ok(sub_id)
     }
-    pub fn subscribe_id(&self, id: &SubscriptionId, filters: Vec<Filter>) -> Result<(), Error> {
-        let subscription = Subscription::new(filters, SubscriptionType::Endless).with_id(id);
+    pub fn subscribe_id(
+        &self,
+        id: &SubscriptionId,
+        filters: Vec<Filter>,
+        timeout: Option<Duration>,
+    ) -> Result<(), Error> {
+        let subscription = Subscription::new(filters, SubscriptionType::Endless)
+            .with_id(id)
+            .timeout(timeout);
         let msg = PoolInput::AddSubscription(subscription);
         self.outside_tx
             .send(msg.clone())
             .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
         Ok(())
     }
-    /// Subscribe until relay sends an "End Of Stored Events" event
-    pub fn subscribe_eose(&self, id: &SubscriptionId, filters: Vec<Filter>) -> Result<(), Error> {
-        let subscription = Subscription::new(filters, SubscriptionType::UntilEOSE).with_id(id);
+    /// Subscribe until relay sends an "End Of Stored Events" notification
+    pub fn subscribe_eose(
+        &self,
+        id: &SubscriptionId,
+        filters: Vec<Filter>,
+        timeout: Option<Duration>,
+    ) -> Result<(), Error> {
+        let subscription = Subscription::new(filters, SubscriptionType::UntilEOSE)
+            .with_id(id)
+            .timeout(timeout);
         let msg = PoolInput::AddSubscription(subscription);
+        self.outside_tx
+            .send(msg.clone())
+            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+        Ok(())
+    }
+    pub fn count(
+        &self,
+        id: &SubscriptionId,
+        filters: Vec<Filter>,
+        timeout: Option<Duration>,
+    ) -> Result<(), Error> {
+        let subscription = Subscription::new(filters, SubscriptionType::Count)
+            .with_id(id)
+            .timeout(timeout);
+        let msg = PoolInput::Count(subscription);
         self.outside_tx
             .send(msg.clone())
             .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
@@ -279,8 +325,9 @@ impl RelayPool {
         &self,
         url: &Url,
         filters: Vec<Filter>,
+        timeout: Option<Duration>,
     ) -> Result<SubscriptionId, Error> {
-        let subscription = Subscription::new(filters, SubscriptionType::Endless);
+        let subscription = Subscription::new(filters, SubscriptionType::Endless).timeout(timeout);
         let sub_id = subscription.id.clone();
         let msg = PoolInput::AddSubscriptionToRelay(url.to_owned(), subscription);
         self.outside_tx
@@ -293,8 +340,11 @@ impl RelayPool {
         url: &Url,
         id: &SubscriptionId,
         filters: Vec<Filter>,
+        timeout: Option<Duration>,
     ) -> Result<(), Error> {
-        let subscription = Subscription::new(filters, SubscriptionType::UntilEOSE).with_id(id);
+        let subscription = Subscription::new(filters, SubscriptionType::UntilEOSE)
+            .with_id(id)
+            .timeout(timeout);
         let msg = PoolInput::AddSubscriptionToRelay(url.to_owned(), subscription);
         self.outside_tx
             .send(msg.clone())
@@ -399,6 +449,7 @@ pub enum PoolInput {
     ToggleWriteFor(Url, bool),
     GetRelayStatusList(mpsc::Sender<RelayStatusList>),
     AddSubscriptionToRelay(Url, Subscription),
+    Count(Subscription),
 }
 #[derive(Debug, Clone)]
 pub enum NotificationEvent {
@@ -410,6 +461,7 @@ pub enum NotificationEvent {
     RelayMessage(Url, RelayMessage),
     SentSubscription(Url, SubscriptionId),
     SentEvent(Url, nostr::EventId),
+    Timeout(Url, SubscriptionId),
 }
 #[derive(Debug, Clone)]
 pub struct RelayToPool {
