@@ -1,0 +1,19 @@
+[package]
+name = "ns-client"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luiz Otávio Cardi Vidoto <luiz.vidoto@hotmail.com>"]
+description = "Client to handle NOSTR connections"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nostr.workspace = true
+tokio.workspace = true
+tokio-tungstenite = {version="0.19.0", features=["rustls-tls-webpki-roots"]}
+tungstenite = "0.19.0"
+futures-util = {version="0.3.28", features=["sink", "std"], default-features=false}
+thiserror = "1.0.40"
+url = "2.3.1"
+log.workspace = true

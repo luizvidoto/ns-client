@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 nostr-sdk = "0.22.0"
-tokio = { version = "1", features = ["full"] }
-log = "0.4.0" 
-env_logger = "0.10.0"
+tokio.workspace = true
+nostr.workspace = true
+log.workspace = true
+env_logger.workspace = true

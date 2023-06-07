@@ -1,15 +1,13 @@
-use std::{collections::HashSet, path::Path, str::FromStr, time::Duration};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use log::debug;
-use nostr::{
-    nips::nip21::NostrURI,
-    prelude::{FromBech32, FromPkStr, FromSkStr},
-    ChannelId, EventId, Keys, RelayMessage, SubscriptionId, Tag, Url,
-};
+use nostr::{EventId, Filter, RelayMessage, SubscriptionId, Url};
+use ns_client::{RelayEvent, RelayPool, SendError, Subscription};
 use tokio::{
     fs::OpenOptions,
     io::{AsyncWriteExt, BufWriter},
-    sync::mpsc,
+    signal,
+    sync::{mpsc, Mutex},
 };
 
 pub(crate) const RELAY_SUGGESTIONS: [&'static str; 3] = [
@@ -57,15 +55,15 @@ async fn main() {
     // Create a new instance of Instant, which marks the current point in time.
     // let start = Instant::now();
 
-    let pool = ns_client::RelayPool::new();
+    let pool = RelayPool::new();
     let mut notifications = pool.notifications();
     log::info!("APP: Connecting to pool");
 
-    // let meta_filter = nostr::Filter::new().kinds(vec![nostr::Kind::Metadata]);
-    // let sent_msgs_sub_past = nostr::Filter::new()
+    // let meta_filter = Filter::new().kinds(vec![nostr::Kind::Metadata]);
+    // let sent_msgs_sub_past = Filter::new()
     //     .kinds(nostr_kinds())
     //     .author(public_key.to_string());
-    // let recv_msgs_sub_past = nostr::Filter::new().kinds(nostr_kinds()).pubkey(public_key);
+    // let recv_msgs_sub_past = Filter::new().kinds(nostr_kinds()).pubkey(public_key);
     // let src_channel_id_1 =
     //     EventId::from_str("f23e652ffda1871d71cd5e1fd6a1f7cc6ef3b42415551814c5a025b68f5bf174")
     //         .unwrap();
@@ -73,46 +71,22 @@ async fn main() {
     //     EventId::from_str("5d7807b7476b78bbb53f9c97aa90b45e44a56f0a709460320e1b6c1a5b16a364")
     //         .unwrap();
 
-    let cars_channel =
-        EventId::from_hex("8233a5d8e27a9415d22c974d70935011664ada55ae3152bd10d697d3a3c74f67")
-            .unwrap();
-    let creation_filter = nostr::Filter::new()
-        .kind(nostr::Kind::ChannelCreation)
-        // .id(cars_channel)
-        .limit(CHANNEL_SEARCH_LIMIT);
-    let metadata_filter = nostr::Filter::new()
-        .kind(nostr::Kind::ChannelMetadata)
-        // .event(cars_channel)
-        .limit(CHANNEL_SEARCH_LIMIT);
-    let messages_filter = nostr::Filter::new()
-        .kind(nostr::Kind::ChannelMessage)
-        // .event(cars_channel)
-        .limit(CHANNEL_SEARCH_LIMIT);
-    let hide_msgs_filter = nostr::Filter::new()
-        .kind(nostr::Kind::ChannelHideMessage)
-        // .event(cars_channel)
-        .limit(CHANNEL_SEARCH_LIMIT);
-    let mute_filter = nostr::Filter::new()
-        .kind(nostr::Kind::ChannelMuteUser)
-        // .event(cars_channel)
-        .limit(CHANNEL_SEARCH_LIMIT);
+    // let cars_channel =
+    //     EventId::from_hex("8233a5d8e27a9415d22c974d70935011664ada55ae3152bd10d697d3a3c74f67")
+    //         .unwrap();
 
+    let creation_filter = Filter::new().kind(nostr::Kind::ChannelCreation).limit(10);
+    let channel_sub_type = SubscriptionId::new(SubscriptionType::Channel.to_string());
     if let Err(e) = pool.subscribe_eose(
-        &SubscriptionId::new(SubscriptionType::Channel.to_string()),
-        vec![
-            creation_filter,
-            metadata_filter,
-            messages_filter,
-            hide_msgs_filter,
-            mute_filter,
-        ],
-        Some(Duration::from_secs(3)),
+        &channel_sub_type,
+        vec![creation_filter],
+        Some(Duration::from_secs(5)),
     ) {
         log::error!("Failed to subscribe: {}", e);
     }
 
     // let contact_list_id = SubscriptionId::new(SubscriptionType::ContactList.to_string());
-    // let contact_list = nostr::Filter::new()
+    // let contact_list = Filter::new()
     //     .kind(nostr::Kind::ContactList)
     //     .limit(CHANNEL_SEARCH_LIMIT);
     // if let Err(e) = pool.subscribe_eose(&contact_list_id, vec![contact_list]) {
@@ -148,72 +122,130 @@ async fn main() {
 
     let (tx, rx) = mpsc::channel(100);
     let file_path = Path::new("output.json");
-    tokio::spawn(async move {
+
+    let tx_1 = tx.clone();
+    let pool_h = tokio::spawn(async move {
         let mut acc = 0;
-        while let Ok(event) = notifications.recv().await {
-            match event {
-                ns_client::NotificationEvent::Timeout(url, sub_id) => {
-                    log::info!("APP: Timeout: {} - {}", url, sub_id);
+        let channel_ids = Arc::new(Mutex::new(HashSet::new()));
+        while let Ok(notification) = notifications.recv().await {
+            let url = notification.url;
+            match notification.event {
+                RelayEvent::ActionsDone(action_id) => {
+                    log::info!("APP: Actions done: {} - {}", url, action_id);
                     acc += 1;
                 }
-                ns_client::NotificationEvent::SentEvent(url, event_id) => {
+                RelayEvent::SentCount(sub_id) => {
+                    log::info!("APP: Sent count: {} - {}", url, sub_id);
+                }
+                RelayEvent::SendError(e) => match e {
+                    SendError::FailedToCloseSubscription(sub_id) => {
+                        log::info!("APP: Failed to close subscription: {} - {}", url, sub_id);
+                    }
+                    SendError::FailedToSendCount(sub_id) => {
+                        log::info!("APP: Failed to send count: {} - {}", url, sub_id);
+                    }
+                    SendError::FailedToSendEvent(id) => {
+                        log::info!("APP: Failed to send event: {} - {}", url, id);
+                    }
+                    SendError::FailedToSendSubscription(sub_id) => {
+                        log::info!("APP: Failed to send subscription: {} - {}", url, sub_id);
+                    }
+                },
+                RelayEvent::RelayInformation(doc) => {
+                    log::info!("APP: Relay document: {} - {:?}", url, doc);
+                }
+                RelayEvent::Timeout(subscription_id) => {
+                    log::info!("APP: Timeout: {} - {}", url, subscription_id);
+                    if subscription_id == channel_sub_type {
+                        send_actions(&pool, &url, &channel_ids).await;
+                    }
+                }
+                RelayEvent::SentEvent(event_id) => {
                     log::info!("APP: Sent event: {} - {}", url, &event_id);
                 }
-                ns_client::NotificationEvent::RelayTerminated(url) => {
-                    log::info!("APP: relay terminated: {}", &url);
-                }
-                ns_client::NotificationEvent::RelayMessage(url, message) => match message {
+                RelayEvent::RelayMessage(message) => match message {
                     RelayMessage::Event {
-                        subscription_id: _,
+                        subscription_id,
                         event,
                     } => {
-                        if let Err(e) = tx.send(event.as_json()).await {
+                        if subscription_id == channel_sub_type {
+                            let mut locked = channel_ids.lock().await;
+                            locked.insert(event.id.to_owned());
+                        }
+                        if let Err(e) = tx_1.send(event.as_json()).await {
                             log::error!("An error occurred while sending the event: {}", e);
                         }
                     }
-                    RelayMessage::EndOfStoredEvents(sub_id) => {
-                        log::info!("APP: END OF STORED EVENTS. ID: {} - {}", &url, sub_id);
-                        acc += 1;
+                    RelayMessage::EndOfStoredEvents(subscription_id) => {
+                        log::info!(
+                            "APP: END OF STORED EVENTS. ID: {} - {}",
+                            &url,
+                            subscription_id
+                        );
+                        if subscription_id == channel_sub_type {
+                            send_actions(&pool, &url, &channel_ids).await;
+                        }
                     }
                     other => {
                         debug!("APP: Relay message: {} - {:?}", url, other);
                     }
                 },
-                ns_client::NotificationEvent::SentSubscription(url, sub_id) => {
+                RelayEvent::SentSubscription(sub_id) => {
                     log::info!("APP: Sent subscription: {} - {:?}", url, sub_id);
                 }
             }
 
             if acc == 3 {
-                if let Err(e) = tx.send("END".to_string()).await {
-                    log::error!("An error occurred while sending the event: {}", e);
-                }
+                break;
             };
         }
     });
 
-    // tokio::spawn(async move {
-    // });
-    tokio::fs::remove_file(file_path).await.unwrap();
-    if let Err(e) = receive_and_write(rx, &file_path).await {
-        log::error!("An error occurred while writing to the file: {}", e);
+    let writer_h = tokio::spawn(async move {
+        _ = tokio::fs::remove_file(file_path).await;
+        if let Err(e) = receive_and_write(rx, &file_path).await {
+            log::error!("An error occurred while writing to the file: {}", e);
+        }
+    });
+
+    let tx = tx.clone();
+    tokio::select! {
+        _ = shutdown_signal() => {}
+        _ = writer_h => {}
+        _ = pool_h => {}
     }
 
-    // let cars_channel =
-    //     ChannelId::from_hex("8233a5d8e27a9415d22c974d70935011664ada55ae3152bd10d697d3a3c74f67")
-    //         .unwrap();
-    // let keys =
-    //     Keys::from_sk_str("4510459b74db68371be462f19ef4f7ef1e6c5a95b1d83a7adf00987c51ac56fe")
-    //         .unwrap();
-    // let my_relay = Url::parse("ws://192.168.15.119:8080").unwrap();
-    // let event = nostr::EventBuilder::new_channel_msg(cars_channel, my_relay, "eai amigos")
-    //     .to_event(&keys)
-    //     .unwrap();
-    // pool.send_event(event).unwrap();
-
-    // tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    log::info!("APP: Shutdown signal received");
+    if let Err(e) = tx.send("END".to_string()).await {
+        log::error!("An error occurred while sending the event: {}", e);
+    }
 
     log::info!("APP: Done");
+}
+
+pub fn make_channel_filter(channel_id: EventId) -> Vec<Filter> {
+    let metadata_filter = Filter::new()
+        .kind(nostr::Kind::ChannelMetadata)
+        .event(channel_id)
+        .limit(CHANNEL_SEARCH_LIMIT);
+    let messages_filter = Filter::new()
+        .kind(nostr::Kind::ChannelMessage)
+        .event(channel_id)
+        .limit(CHANNEL_SEARCH_LIMIT);
+    let hide_msgs_filter = Filter::new()
+        .kind(nostr::Kind::ChannelHideMessage)
+        .event(channel_id)
+        .limit(CHANNEL_SEARCH_LIMIT);
+    let mute_filter = Filter::new()
+        .kind(nostr::Kind::ChannelMuteUser)
+        .event(channel_id)
+        .limit(CHANNEL_SEARCH_LIMIT);
+    vec![
+        metadata_filter,
+        messages_filter,
+        hide_msgs_filter,
+        mute_filter,
+    ]
 }
 
 pub fn nostr_kinds() -> Vec<nostr::Kind> {
@@ -264,6 +296,47 @@ async fn receive_and_write(
     writer.flush().await?;
 
     Ok(())
+}
+
+async fn send_actions(pool: &RelayPool, url: &Url, channel_ids: &Arc<Mutex<HashSet<EventId>>>) {
+    let locked = channel_ids.lock().await;
+    let actions_id = "SomeActionID123".into();
+    _ = pool.relay_eose_actions(
+        &url,
+        actions_id,
+        locked
+            .clone()
+            .into_iter()
+            .map(make_channel_filter)
+            .map(|filters| Subscription::action(filters).timeout(Some(Duration::from_secs(2))))
+            .collect(),
+    );
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    println!("signal received, starting graceful shutdown");
 }
 
 const CHANNEL_SEARCH_LIMIT: usize = 1000;
