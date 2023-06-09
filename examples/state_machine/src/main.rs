@@ -77,11 +77,10 @@ async fn main() {
 
     let creation_filter = Filter::new().kind(nostr::Kind::ChannelCreation).limit(10);
     let channel_sub_type = SubscriptionId::new(SubscriptionType::Channel.to_string());
-    if let Err(e) = pool.subscribe_eose(
-        &channel_sub_type,
-        vec![creation_filter],
-        Some(Duration::from_secs(5)),
-    ) {
+    let subscription = Subscription::new(vec![creation_filter])
+        .with_id(channel_sub_type.to_string())
+        .eose(Some(Duration::from_secs(5)));
+    if let Err(e) = pool.subscribe(&subscription) {
         log::error!("Failed to subscribe: {}", e);
     }
 
@@ -308,7 +307,7 @@ async fn send_actions(pool: &RelayPool, url: &Url, channel_ids: &Arc<Mutex<HashS
             .clone()
             .into_iter()
             .map(make_channel_filter)
-            .map(|filters| Subscription::action(filters).timeout(Some(Duration::from_secs(2))))
+            .map(|filters| Subscription::new(filters).eose(Some(Duration::from_secs(2))))
             .collect(),
     );
 }

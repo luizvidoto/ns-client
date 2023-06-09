@@ -116,6 +116,10 @@ impl RelayInformation {
         }
     }
 
+    pub fn reset_conn_stats(&mut self) {
+        self.conn_stats = RelayConnectionStats::new();
+    }
+
     pub fn push_error(&mut self, error_msg: RelayErrorMessage) {
         self.error_messages.push_back(error_msg);
 
@@ -188,31 +192,10 @@ impl Relay {
     fn terminated(&mut self) {
         self.information.status = RelayStatus::Terminated;
     }
-    fn handle_input_disconnected(&mut self, input: RelayInput) {
-        match input {
-            RelayInput::FetchInformation => {
-                let information = self.information.clone();
-                _ = self
-                    .notification_tx
-                    .send(RelayEvent::RelayInformation(information).into(&self.url));
-            }
-            RelayInput::ToggleRead(read) => {
-                self.read = read;
-            }
-            RelayInput::ToggleWrite(write) => {
-                self.write = write;
-            }
-            RelayInput::Close => {
-                unreachable!("Close should be handled outside this function")
-            }
-            RelayInput::Reconnect => {
-                unreachable!("Reconnect should be handled outside this function")
-            }
-            other => {
-                // send to a queue to be handled when connected
-                self.input_queue.push_back(other);
-            }
-        }
+    async fn reconnect(&mut self) -> (LoopControl, RelayState) {
+        log::debug!("{} - Reconnecting", &self.url);
+        self.information.reset_conn_stats();
+        self.try_connect(0).await
     }
 
     async fn send_event(
@@ -220,7 +203,7 @@ impl Relay {
         event: nostr::Event,
         ws_write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     ) -> Result<(), SendError> {
-        log::debug!("Sending event");
+        log::info!("Sending event");
         let event_id = event.id;
         let msg = ClientMessage::new_event(event);
         log::debug!("{}", msg.as_json());
@@ -235,26 +218,33 @@ impl Relay {
 
     async fn subscribe(
         &mut self,
-        subscription: Subscription,
+        subscription: &Subscription,
         ws_write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     ) -> Result<(), SendError> {
-        log::debug!("Sending subscription request");
+        log::info!("Sending subscription request");
         if self.subscriptions.contains_key(&subscription.id) {
-            log::info!("Already subscribed");
-            return Ok(());
+            self.close_subscription(&subscription.id, ws_write).await?;
         }
 
         let sub_id = subscription.id.clone();
-        if let Some(timeout) = subscription.timeout {
-            let timeout_sender = self.timeout_tx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(timeout).await;
-                _ = timeout_sender.send(sub_id).await;
-            });
+        match subscription.sub_type {
+            SubscriptionType::EOSE { timeout } => {
+                if let Some(timeout) = timeout {
+                    let timeout_sender = self.timeout_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(timeout).await;
+                        _ = timeout_sender.send(sub_id).await;
+                    });
+                }
+            }
+            SubscriptionType::Endless => {}
         }
 
         let sub_id = subscription.id.clone();
-        let msg = ClientMessage::new_req(sub_id.clone(), subscription.filters.clone());
+        let msg = match subscription.verb {
+            Verb::Req => ClientMessage::new_req(sub_id.clone(), subscription.filters.clone()),
+            Verb::Count => ClientMessage::new_count(sub_id.clone(), subscription.filters.clone()),
+        };
 
         log::debug!("{}", msg.as_json());
 
@@ -262,34 +252,9 @@ impl Relay {
             .await
             .map_err(|_| SendError::FailedToSendSubscription(sub_id.clone()))?;
 
-        match subscription.sub_type {
-            SubscriptionType::Action => (),
-            _ => {
-                self.subscriptions.insert(sub_id.clone(), subscription);
-            }
-        }
-
         _ = self
             .notification_tx
             .send(RelayEvent::SentSubscription(sub_id).into(&self.url));
-        Ok(())
-    }
-
-    async fn count(
-        &self,
-        subscription: Subscription,
-        ws_write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    ) -> Result<(), SendError> {
-        log::debug!("Sending count request");
-        let sub_id = subscription.id.clone();
-        let msg = ClientMessage::new_count(sub_id.clone(), subscription.filters);
-        log::debug!("{}", msg.as_json());
-        self.send_ws(ws_write, msg)
-            .await
-            .map_err(|_| SendError::FailedToSendCount(sub_id.clone()))?;
-        _ = self
-            .notification_tx
-            .send(RelayEvent::SentCount(sub_id).into(&self.url));
         Ok(())
     }
 
@@ -298,7 +263,7 @@ impl Relay {
         sub_id: &SubscriptionId,
         ws_write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     ) -> Result<(), SendError> {
-        log::debug!("Sending close subscription");
+        log::info!("Sending close subscription");
         let msg = ClientMessage::close(sub_id.clone());
         log::debug!("{}", msg.as_json());
         self.send_ws(ws_write, msg)
@@ -308,7 +273,7 @@ impl Relay {
         Ok(())
     }
 
-    fn find_subscription(
+    fn find_action_subscription(
         &mut self,
         sub_id: &SubscriptionId,
     ) -> (Option<String>, Option<Subscription>) {
@@ -347,7 +312,7 @@ impl Relay {
     ) -> Result<(), SendError> {
         if let RelayMessage::EndOfStoredEvents(sub_id) = &message {
             // Find action_id and subscription or dont find anything
-            match self.find_subscription(&sub_id) {
+            match self.find_action_subscription(&sub_id) {
                 (Some(action_id), Some(removed_sub)) => {
                     self.close_subscription(&removed_sub.id, ws_write).await?;
                     let next_subscription = self
@@ -357,7 +322,7 @@ impl Relay {
                         .map(|(_id, subscription)| subscription.to_owned());
 
                     if let Some(subscription) = next_subscription {
-                        self.subscribe(subscription, ws_write).await?;
+                        self.subscribe(&subscription, ws_write).await?;
                     } else {
                         _ = self
                             .notification_tx
@@ -369,12 +334,95 @@ impl Relay {
             }
 
             if let Some(subscription) = self.subscriptions.get(&sub_id) {
-                if let SubscriptionType::UntilEOSE = subscription.sub_type {
+                if let SubscriptionType::EOSE { .. } = subscription.sub_type {
                     self.close_subscription(&sub_id, ws_write).await?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn handle_input_disconnected_other(&mut self, input: RelayInput) {
+        match input {
+            RelayInput::FetchInformation => {
+                let information = self.information.clone();
+                _ = self
+                    .notification_tx
+                    .send(RelayEvent::RelayInformation(information).into(&self.url));
+            }
+            RelayInput::ToggleRead(read) => {
+                self.read = read;
+            }
+            RelayInput::ToggleWrite(write) => {
+                self.write = write;
+            }
+            RelayInput::Close => {
+                unreachable!("Close should be handled outside this function")
+            }
+            RelayInput::Reconnect => {
+                unreachable!("Reconnect should be handled outside this function")
+            }
+            other => {
+                // send to a queue to be handled when connected
+                self.input_queue.push_back(other);
+            }
+        }
+    }
+    async fn handle_input_disconnected(
+        &mut self,
+        input: Option<RelayInput>,
+    ) -> Option<(LoopControl, RelayState)> {
+        if let Some(input) = input {
+            match input {
+                RelayInput::Close => {
+                    log::debug!("Closing relay");
+                    _ = self
+                        .pool_tx
+                        .send(RelayToPoolEvent::Closed.into(&self.url))
+                        .await;
+                    self.terminated();
+                    return Some((LoopControl::Continue, RelayState::Terminated));
+                }
+                RelayInput::Reconnect => {
+                    log::debug!("Received Reconnect input, trying to connect immediately");
+                    return Some(self.reconnect().await);
+                }
+                other => self.handle_input_disconnected_other(other),
+            }
+        } else {
+            log::debug!("{} - relay input receiver closed", &self.url);
+            return Some((LoopControl::Break, RelayState::Terminated));
+        }
+
+        None
+    }
+
+    async fn try_connect(&mut self, delay: u64) -> (LoopControl, RelayState) {
+        log::debug!("{} - Trying to connect", &self.url);
+        self.new_attempt();
+
+        let attempts = self.attempts();
+        if attempts >= MAX_ATTEMPS {
+            log::debug!("{} - max attempts exceeded - {}", &self.url, attempts);
+            _ = self
+                .pool_tx
+                .send(RelayToPoolEvent::MaxAttempsExceeded.into(&self.url))
+                .await;
+            return (LoopControl::Continue, RelayState::Terminated);
+        }
+
+        let (conn_tx, conn_rx) = oneshot::channel();
+        spawn_get_connection(self.url.clone(), conn_tx);
+
+        _ = self
+            .pool_tx
+            .send(RelayToPoolEvent::AttempToConnect.into(&self.url))
+            .await;
+
+        (
+            LoopControl::Continue,
+            RelayState::Connecting { conn_rx, delay },
+        )
     }
 
     async fn handle_terminated(&mut self, state: RelayState) -> (LoopControl, RelayState) {
@@ -392,7 +440,7 @@ impl Relay {
                         .await;
                     return (LoopControl::Continue, RelayState::new());
                 }
-                other => self.handle_input_disconnected(other),
+                other => self.handle_input_disconnected_other(other),
             }
         } else {
             log::debug!("{} - relay input receiver closed", &self.url);
@@ -402,75 +450,26 @@ impl Relay {
     }
 
     async fn handle_disconnected(&mut self, mut state: RelayState) -> (LoopControl, RelayState) {
-        if let RelayState::Disconnected {
-            delay_to_connect_millis,
-        } = &mut state
-        {
-            self.new_attempt();
-
-            let attempts = self.attempts();
-            if attempts >= MAX_ATTEMPS {
-                log::debug!("{} - max attempts exceeded - {}", &self.url, attempts);
-                _ = self
-                    .pool_tx
-                    .send(RelayToPoolEvent::MaxAttempsExceeded.into(&self.url))
-                    .await;
-                return (LoopControl::Continue, RelayState::Terminated);
-            }
-
+        if let RelayState::Disconnected { delay } = &mut state {
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(*delay_to_connect_millis)) => (),
+                _ = tokio::time::sleep(Duration::from_millis(*delay)) => {
+                    log::debug!("{} - sleeping", &self.url);
+                },
                 input = self.input.recv() => {
-                    if let Some(input) = input {
-                        match input {
-                            RelayInput::Close => {
-                                log::debug!("Closing relay");
-                                _ = self
-                                    .pool_tx
-                                    .send(RelayToPoolEvent::Closed.into(&self.url))
-                                    .await;
-                                self.terminated();
-                                return (LoopControl::Continue, RelayState::Terminated);
-                            }
-                            RelayInput::Reconnect => {
-                                // ignore reconnect when not terminated
-                                log::debug!("Ignoring Reconnect relay. Relay is trying to connect");
-                            }
-                            other => self.handle_input_disconnected(other),
-                        }
-                    } else {
-                        log::debug!("{} - relay input receiver closed", &self.url);
-                        return (LoopControl::Break, state);
+                    if let Some((ctrl, state)) = self.handle_input_disconnected(input).await {
+                        return (ctrl, state);
                     }
                 }
             }
 
-            let (conn_tx, conn_rx) = oneshot::channel();
-            spawn_get_connection(self.url.clone(), conn_tx);
-
-            _ = self
-                .pool_tx
-                .send(RelayToPoolEvent::AttempToConnect.into(&self.url))
-                .await;
-
-            (
-                LoopControl::Continue,
-                RelayState::Connecting {
-                    conn_rx,
-                    delay_to_connect_millis: *delay_to_connect_millis,
-                },
-            )
-        } else {
-            (LoopControl::Continue, state)
+            return self.try_connect(*delay).await;
         }
+
+        (LoopControl::Continue, state)
     }
 
     async fn handle_connecting(&mut self, mut state: RelayState) -> (LoopControl, RelayState) {
-        if let RelayState::Connecting {
-            conn_rx,
-            delay_to_connect_millis,
-        } = &mut state
-        {
+        if let RelayState::Connecting { conn_rx, delay } = &mut state {
             tokio::select! {
                 input = self.input.recv() => {
                     if let Some(input) = input {
@@ -488,7 +487,7 @@ impl Relay {
                                 // ignore reconnect when not terminated
                                 log::debug!("Ignoring Reconnect relay. Relay is trying to connect");
                             }
-                            other => self.handle_input_disconnected(other),
+                            other => self.handle_input_disconnected_other(other),
                         }
                     } else {
                         log::debug!("{} - relay input receiver closed", &self.url);
@@ -518,7 +517,7 @@ impl Relay {
                                     .pool_tx
                                     .send(RelayToPoolEvent::FailedToConnect.into(&self.url))
                                     .await;
-                                return (LoopControl::Continue, RelayState::retry_with_delay(*delay_to_connect_millis));
+                                return (LoopControl::Continue, RelayState::retry_with_delay(*delay));
                             }
                         },
                         Err(e) => {
@@ -565,23 +564,6 @@ impl Relay {
         input: RelayInput,
     ) {
         let result = match input {
-            RelayInput::EoseActions(action_id, subscriptions) => {
-                if let Some(sub) = subscriptions.first() {
-                    match self.subscribe(sub.to_owned(), ws_write).await {
-                        Ok(_) => {
-                            let mut actions = BTreeMap::new();
-                            for subscription in subscriptions {
-                                actions.insert(subscription.id.clone(), subscription);
-                            }
-                            self.eose_actions.insert(action_id, actions);
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    Ok(())
-                }
-            }
             RelayInput::FetchInformation => {
                 let information = self.information.clone();
                 _ = self
@@ -601,8 +583,29 @@ impl Relay {
                 self.close_subscription(&sub_id, ws_write).await
             }
             RelayInput::SendEvent(event) => self.send_event(event, ws_write).await,
-            RelayInput::Subscribe(subscription) => self.subscribe(subscription, ws_write).await,
-            RelayInput::Count(subscription) => self.count(subscription, ws_write).await,
+            RelayInput::Subscribe(subscription) => {
+                self.subscribe(&subscription, ws_write).await;
+                self.subscriptions
+                    .insert(subscription.id.clone(), subscription);
+                Ok(())
+            }
+            RelayInput::EoseActions(action_id, subscriptions) => {
+                if let Some(subscription) = subscriptions.first() {
+                    match self.subscribe(subscription, ws_write).await {
+                        Ok(_) => {
+                            let mut actions = BTreeMap::new();
+                            for subscription in subscriptions {
+                                actions.insert(subscription.id.clone(), subscription);
+                            }
+                            self.eose_actions.insert(action_id, actions);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Ok(())
+                }
+            }
             RelayInput::Close => {
                 unreachable!("RelayInput::Close should not be handled by this function");
             }
@@ -773,10 +776,10 @@ pub enum RelayState {
     },
     Connecting {
         conn_rx: oneshot::Receiver<ConnResult>,
-        delay_to_connect_millis: u64,
+        delay: u64,
     },
     Disconnected {
-        delay_to_connect_millis: u64,
+        delay: u64,
     },
     Terminated,
 }
@@ -807,19 +810,11 @@ impl RelayState {
         }
     }
     pub fn new() -> Self {
-        RelayState::Disconnected {
-            delay_to_connect_millis: 0,
-        }
+        RelayState::Disconnected { delay: 0 }
     }
-    pub fn retry_with_delay(delay_to_connect_millis: u64) -> Self {
-        let delay_to_connect_millis = if delay_to_connect_millis == 0 {
-            1000
-        } else {
-            delay_to_connect_millis * 2
-        };
-        RelayState::Disconnected {
-            delay_to_connect_millis,
-        }
+    pub fn retry_with_delay(delay: u64) -> Self {
+        let delay = if delay == 0 { 1000 } else { delay * 2 };
+        RelayState::Disconnected { delay }
     }
 }
 
@@ -858,7 +853,6 @@ pub enum RelayInput {
     Subscribe(Subscription),
     Close,
     Reconnect,
-    Count(Subscription),
     CloseSubscription(SubscriptionId),
     FetchInformation,
     EoseActions(String, Vec<Subscription>),
@@ -922,67 +916,53 @@ impl RelayOptions {
     }
 }
 
-const MAX_ATTEMPS: usize = 5;
+#[derive(Debug, Clone)]
+pub enum Verb {
+    Req,
+    Count,
+}
 
 #[derive(Debug, Clone)]
 pub struct Subscription {
     pub id: SubscriptionId,
     pub filters: Vec<Filter>,
+    pub verb: Verb,
     pub sub_type: SubscriptionType,
-    pub status: SubscriptionStatus,
-    pub timeout: Option<Duration>,
 }
 impl Subscription {
     pub fn new(filters: Vec<Filter>) -> Self {
         Self {
             id: SubscriptionId::generate(),
             filters,
+            verb: Verb::Req,
             sub_type: SubscriptionType::Endless,
-            status: SubscriptionStatus::Active,
-            timeout: None,
         }
     }
-    pub fn eose(filters: Vec<Filter>) -> Self {
-        let mut subscription = Self::new(filters);
-        subscription.sub_type = SubscriptionType::UntilEOSE;
-        subscription
-    }
-    pub fn count(filters: Vec<Filter>) -> Self {
-        let mut subscription = Self::new(filters);
-        subscription.sub_type = SubscriptionType::Count;
-        subscription
-    }
-    pub fn action(filters: Vec<Filter>) -> Self {
-        let mut subscription = Self::new(filters);
-        subscription.sub_type = SubscriptionType::Action;
-        subscription
-    }
-    pub fn with_id(mut self, id: &SubscriptionId) -> Self {
-        self.id = id.to_owned();
+    /// Subscribe until relay sends an "End Of Stored Events" notification or timeout is reached
+    pub fn eose(mut self, timeout: Option<Duration>) -> Self {
+        self.sub_type = SubscriptionType::EOSE { timeout };
         self
     }
-    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.timeout = timeout;
+    pub fn count(mut self) -> Self {
+        self.verb = Verb::Count;
         self
     }
-    pub fn done(&mut self) {
-        self.status = SubscriptionStatus::Done;
+    pub fn with_id<S>(mut self, id: S) -> Self
+    where
+        S: Into<String>,
+    {
+        self.id = SubscriptionId::new(id);
+        self
     }
 }
 #[derive(Debug, Clone)]
 pub enum SubscriptionType {
-    Count,
-    UntilEOSE,
+    EOSE { timeout: Option<Duration> },
     Endless,
-    Action,
-}
-#[derive(Debug, Clone)]
-pub enum SubscriptionStatus {
-    Active,
-    Done,
 }
 
 const MAX_ERROR_MSGS_LIMIT: u8 = 100;
+const MAX_ATTEMPS: usize = 3;
 
 // match doc_rx.await {
 //     Ok(Ok(document)) => {

@@ -1,7 +1,5 @@
-use nostr::Filter;
 use nostr::SubscriptionId;
 use std::collections::HashMap;
-use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use url::Url;
 
@@ -11,7 +9,6 @@ use crate::relay::RelayInput;
 use crate::relay::RelayOptions;
 use crate::relay::RelayToPoolEvent;
 use crate::relay::Subscription;
-use crate::relay::SubscriptionType;
 use crate::Error;
 use crate::RelayStatus;
 
@@ -67,14 +64,10 @@ impl RelayPoolTask {
                     for (_sub_id, subscription) in &self.subscriptions {
                         let relay_tx_1 = listener.relay_tx.clone();
                         let subscription = subscription.to_owned();
-                        let message = match subscription.sub_type {
-                            SubscriptionType::Count => RelayInput::Count(subscription),
-                            SubscriptionType::UntilEOSE => RelayInput::Subscribe(subscription),
-                            SubscriptionType::Endless => RelayInput::Subscribe(subscription),
-                            SubscriptionType::Action => RelayInput::Subscribe(subscription),
-                        };
                         tokio::spawn(async move {
-                            if let Err(e) = relay_tx_1.send(message).await {
+                            if let Err(e) =
+                                relay_tx_1.send(RelayInput::Subscribe(subscription)).await
+                            {
                                 log::debug!("relay dropped: {}", e);
                             }
                         });
@@ -217,13 +210,7 @@ impl RelayPoolTask {
                 None
             }
             PoolInput::ReconnectRelay(url) => {
-                process_reconnect_relay(url, &mut self.relays).await;
-                None
-            }
-            PoolInput::Count(subscription) => {
-                self.subscriptions
-                    .insert(subscription.id.clone(), subscription.clone());
-                self.send_to_all(RelayInput::Count(subscription)).await;
+                self.send_to_listener(&url, RelayInput::Reconnect).await;
                 None
             }
             PoolInput::AddSubscription(subscription) => {
@@ -258,6 +245,17 @@ impl RelayPoolTask {
                 self.send_to_all(RelayInput::FetchInformation).await;
                 None
             }
+            PoolInput::GetRelayStatusList(one_tx) => {
+                let status: RelayStatusList = self
+                    .relays
+                    .iter()
+                    .map(|(url, listener)| (url.clone(), listener.status))
+                    .collect();
+                if let Err(e) = one_tx.send(status).await {
+                    log::debug!("Failed to send relays status: {}", e);
+                }
+                None
+            }
         }
     }
 }
@@ -284,87 +282,21 @@ impl RelayPool {
     pub fn notifications(&self) -> broadcast::Receiver<NotificationEvent> {
         self.notification_sender.subscribe()
     }
-    pub fn subscribe(
-        &self,
-        filters: Vec<Filter>,
-        timeout: Option<Duration>,
-    ) -> Result<SubscriptionId, Error> {
-        let subscription = Subscription::new(filters).timeout(timeout);
-        let sub_id = subscription.id.clone();
-        let msg = PoolInput::AddSubscription(subscription);
-        self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
-        Ok(sub_id)
-    }
-    pub fn subscribe_id(
-        &self,
-        id: &SubscriptionId,
-        filters: Vec<Filter>,
-        timeout: Option<Duration>,
-    ) -> Result<(), Error> {
-        let subscription = Subscription::new(filters).with_id(id).timeout(timeout);
-        let msg = PoolInput::AddSubscription(subscription);
+    pub fn subscribe(&self, subscription: &Subscription) -> Result<(), Error> {
+        let msg = PoolInput::AddSubscription(subscription.to_owned());
         self.outside_tx
             .send(msg.clone())
             .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
         Ok(())
     }
-    /// Subscribe until relay sends an "End Of Stored Events" notification
-    pub fn subscribe_eose(
-        &self,
-        id: &SubscriptionId,
-        filters: Vec<Filter>,
-        timeout: Option<Duration>,
-    ) -> Result<(), Error> {
-        let subscription = Subscription::eose(filters).with_id(id).timeout(timeout);
-        let msg = PoolInput::AddSubscription(subscription);
+    pub fn relay_subscribe(&self, url: &Url, subscription: &Subscription) -> Result<(), Error> {
+        let msg = PoolInput::AddSubscriptionToRelay(url.to_owned(), subscription.to_owned());
         self.outside_tx
             .send(msg.clone())
             .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
         Ok(())
     }
-    pub fn count(
-        &self,
-        id: &SubscriptionId,
-        filters: Vec<Filter>,
-        timeout: Option<Duration>,
-    ) -> Result<(), Error> {
-        let subscription = Subscription::count(filters).with_id(id).timeout(timeout);
-        let msg = PoolInput::Count(subscription);
-        self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
-        Ok(())
-    }
-    pub fn subscribe_relay(
-        &self,
-        url: &Url,
-        filters: Vec<Filter>,
-        timeout: Option<Duration>,
-    ) -> Result<SubscriptionId, Error> {
-        let subscription = Subscription::new(filters).timeout(timeout);
-        let sub_id = subscription.id.clone();
-        let msg = PoolInput::AddSubscriptionToRelay(url.to_owned(), subscription);
-        self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
-        Ok(sub_id)
-    }
-    pub fn relay_subscribe_eose(
-        &self,
-        url: &Url,
-        id: &SubscriptionId,
-        filters: Vec<Filter>,
-        timeout: Option<Duration>,
-    ) -> Result<(), Error> {
-        let subscription = Subscription::eose(filters).with_id(id).timeout(timeout);
-        let msg = PoolInput::AddSubscriptionToRelay(url.to_owned(), subscription);
-        self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
-        Ok(())
-    }
+
     pub fn reconnect_relay(&self, url: &Url) -> Result<(), Error> {
         let msg = PoolInput::ReconnectRelay(url.to_owned());
         self.outside_tx
@@ -460,6 +392,21 @@ impl RelayPool {
             .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
         Ok(())
     }
+    pub async fn relay_status_list(&self) -> Result<RelayStatusList, Error> {
+        log::info!("relays status list");
+        let (tx, mut rx) = mpsc::channel(1);
+        let msg = PoolInput::GetRelayStatusList(tx);
+
+        self.outside_tx
+            .send(msg.clone())
+            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+
+        if let Some(list) = rx.recv().await {
+            Ok(list)
+        } else {
+            Err(Error::UnableToGetRelaysStatus)
+        }
+    }
 }
 
 pub type RelayStatusList = Vec<(Url, RelayStatus)>;
@@ -475,10 +422,10 @@ pub enum PoolInput {
     ToggleReadFor(Url, bool),
     ToggleWriteFor(Url, bool),
     AddSubscriptionToRelay(Url, Subscription),
-    Count(Subscription),
     GetRelayInformation(Url),
     GetAllRelaysInformation,
     EoseActionsTo(Url, String, Vec<Subscription>),
+    GetRelayStatusList(mpsc::Sender<RelayStatusList>),
 }
 #[derive(Debug, Clone)]
 pub struct RelayToPool {
@@ -504,16 +451,6 @@ async fn process_add_relay(
         relay.run().await;
     });
     listeners.insert(url.clone(), RelayListener::new(relay_input_sender));
-}
-
-async fn process_reconnect_relay(url: Url, relays: &mut HashMap<Url, RelayListener>) {
-    if let Some(listener) = relays.get_mut(&url) {
-        if let Err(e) = listener.relay_tx.try_send(RelayInput::Reconnect) {
-            log::debug!("Failed to send reconnect to relay: {}", e);
-        }
-    } else {
-        log::warn!("Relay not found");
-    }
 }
 
 const EVENT_SENDER_CHANNEL_SIZE: usize = 10000;
