@@ -1,10 +1,13 @@
-use std::{str::FromStr, time::Duration};
-
-use nostr::{Filter, Kind, RelayMessage, Timestamp};
+use crossterm::{
+    event::{read, Event, KeyCode},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
+use nostr::{Filter, Kind, RelayMessage, Timestamp, Url};
 use ns_client::{RelayEvent, Subscription};
+use std::{str::FromStr, time::Duration};
 use tokio::signal;
 
-pub(crate) const RELAY_SUGGESTIONS: [&'static str; 16] = [
+pub(crate) const _RELAY_SUGGESTIONS: [&'static str; 16] = [
     "wss://relay.plebstr.com",
     "wss://relay.snort.social",
     "wss://relay.damus.io",
@@ -80,105 +83,94 @@ async fn main() {
             let url = event.url;
             match event.event {
                 RelayEvent::ActionsDone(actions_id) => {
-                    log::info!("APP: Actions done: {} - {}", url, actions_id);
+                    log::trace!("APP: Actions done: {} - {}", url, actions_id);
                 }
                 RelayEvent::SentCount(sub_id) => {
-                    log::info!("APP: Sent count: {} - {}", url, sub_id);
+                    log::trace!("APP: Sent count: {} - {}", url, sub_id);
                 }
                 RelayEvent::SendError(e) => {
-                    log::info!("APP: Send error: {} - {}", url, e);
+                    log::trace!("APP: Send error: {} - {}", url, e);
                 }
                 RelayEvent::RelayInformation(doc) => {
-                    log::info!("APP: Relay document: {} - {:?}", url, doc);
+                    log::trace!("APP: Relay document: {} - {:?}", url, doc);
                 }
                 RelayEvent::Timeout(sub_id) => {
-                    log::info!("APP: Timeout: {} - {}", url, sub_id);
+                    log::trace!("APP: Timeout: {} - {}", url, sub_id);
                 }
                 RelayEvent::SentEvent(event_id) => {
-                    log::info!("APP: Sent event: {} - {}", url, &event_id);
+                    log::trace!("APP: Sent event: {} - {}", url, &event_id);
                 }
                 RelayEvent::RelayMessage(message) => match message {
                     RelayMessage::Event {
                         subscription_id: sub_id,
                         event,
                     } => {
-                        log::info!("APP: Event: {} - {} - {:?}", &url, sub_id, event);
+                        log::trace!("APP: Event: {} - {} - {:?}", &url, sub_id, event);
                     }
                     RelayMessage::EndOfStoredEvents(sub_id) => {
-                        log::info!("APP: EOSE. ID: {} - {}", &url, sub_id);
+                        log::trace!("APP: EOSE. ID: {} - {}", &url, sub_id);
                     }
                     other => {
-                        log::info!("APP: Relay message: {} - {:?}", url, other);
+                        log::trace!("APP: Relay message: {} - {:?}", url, other);
                     }
                 },
                 RelayEvent::SentSubscription(sub_id) => {
-                    log::info!("APP: Sent subscription: {} - {:?}", url, sub_id);
+                    log::trace!("APP: Sent subscription: {} - {:?}", url, sub_id);
                 }
             }
         }
     });
 
-    // // update 1
-    // let contacts = vec![
-    //     XOnlyPublicKey::from_str(
-    //         "8860df7d3b24bfb40fe5bdd2041663d35d3e524ce7376628aa55a7d3e624ac46",
-    //     )
-    //     .unwrap(),
-    //     XOnlyPublicKey::from_str(
-    //         "4cced2fb18ff00d32b4f01a65e9cfcc7e3c607024fd8c6604186de40e50aae03",
-    //     )
-    //     .unwrap(),
-    // ];
-    // let subscription = Subscription::new(vec![contact_list_metadata_filter(&contacts, 0)])
-    //     .with_id("contact_list_metadata");
-    // pool.subscribe(&subscription).unwrap();
+    let pool_1 = pool.clone();
+    let _event_loop_h = tokio::spawn(async move {
+        enable_raw_mode().unwrap();
+        loop {
+            // read user input
+            let event = read().unwrap();
 
-    // // update 2
-    // let contacts = vec![
-    //     XOnlyPublicKey::from_str(
-    //         "8860df7d3b24bfb40fe5bdd2041663d35d3e524ce7376628aa55a7d3e624ac46",
-    //     )
-    //     .unwrap(),
-    //     XOnlyPublicKey::from_str(
-    //         "4cced2fb18ff00d32b4f01a65e9cfcc7e3c607024fd8c6604186de40e50aae03",
-    //     )
-    //     .unwrap(),
-    //     XOnlyPublicKey::from_str(
-    //         "9e45b5e573adfb70be9f81e6f19e3df334fa24b3a7273859104d399ccbf64e94",
-    //     )
-    //     .unwrap(),
-    // ];
-    // let subscription = Subscription::new(vec![contact_list_metadata_filter(&contacts, 0)])
-    //     .with_id("contact_list_metadata");
-    // pool.subscribe(&subscription).unwrap();
+            // handle user input
+            match event {
+                Event::Key(event) => match event.code {
+                    KeyCode::Char('r') => {
+                        let url = Url::parse("ws://192.168.15.119:8080").unwrap();
+                        log::debug!("APP: Reconnecting to {}", url);
+                        let pool_2 = pool_1.clone();
+                        tokio::spawn(async move {
+                            pool_2.reconnect_relay(&url).unwrap();
+                        });
+                    }
+                    KeyCode::Char('c') => {
+                        break;
+                    }
+                    _ => (),
+                },
+                _ => (),
+            }
+        }
 
-    // // update 3
-    // let contacts = vec![
-    //     XOnlyPublicKey::from_str(
-    //         "8860df7d3b24bfb40fe5bdd2041663d35d3e524ce7376628aa55a7d3e624ac46",
-    //     )
-    //     .unwrap(),
-    //     XOnlyPublicKey::from_str(
-    //         "4cced2fb18ff00d32b4f01a65e9cfcc7e3c607024fd8c6604186de40e50aae03",
-    //     )
-    //     .unwrap(),
-    //     XOnlyPublicKey::from_str(
-    //         "9e45b5e573adfb70be9f81e6f19e3df334fa24b3a7273859104d399ccbf64e94",
-    //     )
-    //     .unwrap(),
-    //     XOnlyPublicKey::from_str(
-    //         "dafb7c5a8d3a061a8254eb9ffb132cceec0b5080357531006e127263121e3adc",
-    //     )
-    //     .unwrap(),
-    // ];
-    // let subscription = Subscription::new(vec![contact_list_metadata_filter(&contacts, 0)])
-    //     .with_id("contact_list_metadata");
-    // pool.subscribe(&subscription).unwrap();
+        disable_raw_mode().unwrap();
+    });
+
+    // let _event_loop_h = tokio::spawn(async move {
+    //     tokio::time::sleep(Duration::from_secs(20)).await;
+    //     let url = Url::parse("ws://192.168.15.119:8080").unwrap();
+    //     log::debug!("APP: Reconnecting to {}", url);
+    //     pool_1.reconnect_relay(&url).unwrap();
+    // });
 
     let loop_h = tokio::spawn(async move {
         loop {
-            let list = pool.relay_status_list().await;
-            log::info!("APP: Relay status list: {:?}", list);
+            match pool.relay_status_list().await {
+                Ok(list) => {
+                    for l in list {
+                        log::info!("{} - {}", l.0, l.1);
+                    }
+                }
+                Err(e) => {
+                    log::error!("{}", e);
+                }
+            };
+
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });

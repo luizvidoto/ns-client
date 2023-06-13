@@ -1,6 +1,6 @@
 use nostr::SubscriptionId;
 use std::collections::HashMap;
-use std::time::Duration;
+use tokio::sync::oneshot;
 use tokio::sync::{broadcast, mpsc};
 use url::Url;
 
@@ -146,12 +146,18 @@ impl RelayPoolTask {
                                 }
                                 break;
                             },
-                            other => self.handle_input(other).await
+                            other => {
+                                let break_loop = self.handle_input(other).await;
+                                if break_loop {
+                                    break;
+                                }
+                            }
                         }
                     } else {
                         log::debug!("Outside channel closed");
-                        None
+                        break;
                     }
+                    None
                 }
             };
 
@@ -179,13 +185,12 @@ impl RelayPoolTask {
         }
     }
 
-    async fn handle_input(&mut self, input: PoolInput) -> Option<NotificationEvent> {
+    async fn handle_input(&mut self, input: PoolInput) -> bool {
         match input {
             PoolInput::EoseActionsTo(url, actions_id, subscriptions) => {
                 log::debug!("Eose actions to {} - {:?}", url, subscriptions);
                 self.send_to_listener(&url, RelayInput::EoseActions(actions_id, subscriptions))
                     .await;
-                None
             }
             PoolInput::Shutdown => {
                 unreachable!("Shutdown should be handled before")
@@ -193,7 +198,6 @@ impl RelayPoolTask {
             PoolInput::GetRelayInformation(url) => {
                 self.send_to_listener(&url, RelayInput::FetchInformation)
                     .await;
-                None
             }
             PoolInput::AddRelay(url, opts) => {
                 process_add_relay(
@@ -204,47 +208,38 @@ impl RelayPoolTask {
                     &mut self.relays,
                 )
                 .await;
-                None
             }
             PoolInput::SendEvent(event) => {
                 self.send_to_all(RelayInput::SendEvent(event)).await;
-                None
             }
             PoolInput::ReconnectRelay(url) => {
                 self.send_to_listener(&url, RelayInput::Reconnect).await;
-                None
             }
             PoolInput::AddSubscription(subscription) => {
                 self.subscriptions
                     .insert(subscription.id.clone(), subscription.clone());
                 self.send_to_all(RelayInput::Subscribe(subscription)).await;
-                None
             }
             PoolInput::AddSubscriptionToRelay(relay_url, subscription) => {
                 self.subscriptions
                     .insert(subscription.id.clone(), subscription.clone());
                 self.send_to_listener(&relay_url, RelayInput::Subscribe(subscription))
                     .await;
-                None
             }
             PoolInput::RemoveRelay(url) => {
                 self.send_to_listener(&url, RelayInput::Close).await;
                 self.relays.remove(&url);
-                None
             }
             PoolInput::ToggleReadFor(url, read) => {
                 self.send_to_listener(&url, RelayInput::ToggleRead(read))
                     .await;
-                None
             }
             PoolInput::ToggleWriteFor(url, write) => {
                 self.send_to_listener(&url, RelayInput::ToggleWrite(write))
                     .await;
-                None
             }
             PoolInput::GetAllRelaysInformation => {
                 self.send_to_all(RelayInput::FetchInformation).await;
-                None
             }
             PoolInput::GetRelayStatusList(one_tx) => {
                 let status: RelayStatusList = self
@@ -252,12 +247,15 @@ impl RelayPoolTask {
                     .iter()
                     .map(|(url, listener)| (url.clone(), listener.status))
                     .collect();
-                if let Err(e) = one_tx.send(status).await {
-                    log::debug!("Failed to send relays status: {}", e);
+
+                if let Err(_e) = one_tx.send(status) {
+                    log::debug!("Failed to send relays status");
+                    return true;
                 }
-                None
             }
         }
+
+        false
     }
 }
 
@@ -286,23 +284,24 @@ impl RelayPool {
     pub fn subscribe(&self, subscription: &Subscription) -> Result<(), Error> {
         let msg = PoolInput::AddSubscription(subscription.to_owned());
         self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+            .send(msg)
+            .map_err(|e| Error::SendToPoolTaskFailed(format!("AddSubscription. error: {}", e)))?;
         Ok(())
     }
     pub fn relay_subscribe(&self, url: &Url, subscription: &Subscription) -> Result<(), Error> {
         let msg = PoolInput::AddSubscriptionToRelay(url.to_owned(), subscription.to_owned());
-        self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+        self.outside_tx.send(msg).map_err(|e| {
+            Error::SendToPoolTaskFailed(format!("AddSubscriptionToRelay. error: {}", e))
+        })?;
         Ok(())
     }
 
     pub fn reconnect_relay(&self, url: &Url) -> Result<(), Error> {
         let msg = PoolInput::ReconnectRelay(url.to_owned());
         self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))
+            .send(msg)
+            .map_err(|e| Error::SendToPoolTaskFailed(format!("ReconnectRelay. error: {}", e)))?;
+        Ok(())
     }
     pub fn add_relay(&self, url: &str) -> Result<Url, Error> {
         log::trace!("Adding relay {}", url);
@@ -310,8 +309,8 @@ impl RelayPool {
         let opts = RelayOptions::default();
         let msg = PoolInput::AddRelay(url.clone(), opts);
         self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+            .send(msg)
+            .map_err(|e| Error::SendToPoolTaskFailed(format!("AddRelay. error: {}", e)))?;
         Ok(url)
     }
     pub fn add_relay_with_opts(&self, url: &str, opts: RelayOptions) -> Result<Url, Error> {
@@ -319,66 +318,66 @@ impl RelayPool {
         let url = Url::parse(url)?;
         let msg = PoolInput::AddRelay(url.clone(), opts);
         self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+            .send(msg)
+            .map_err(|e| Error::SendToPoolTaskFailed(format!("AddRelay. error: {}", e)))?;
         Ok(url)
     }
     pub fn shutdown(&self) -> Result<(), Error> {
         log::info!("shutdown client");
         let msg = PoolInput::Shutdown;
         self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+            .send(msg)
+            .map_err(|e| Error::SendToPoolTaskFailed(format!("Shutdown. error: {}", e)))?;
         Ok(())
     }
     pub fn send_event(&self, event: nostr::Event) -> Result<(), Error> {
-        log::info!("send event to relays");
+        log::trace!("send event to relays");
         let msg = PoolInput::SendEvent(event);
         self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+            .send(msg)
+            .map_err(|e| Error::SendToPoolTaskFailed(format!("SendEvent. error: {}", e)))?;
         Ok(())
     }
     pub fn remove_relay(&self, url: &str) -> Result<(), Error> {
-        log::info!("remove relay {}", url);
+        log::trace!("remove relay {}", url);
         let url = Url::parse(url)?;
         let msg = PoolInput::RemoveRelay(url);
         self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+            .send(msg)
+            .map_err(|e| Error::SendToPoolTaskFailed(format!("RemoveRelay. error: {}", e)))?;
         Ok(())
     }
     pub fn toggle_read_for(&self, url: &Url, read: bool) -> Result<(), Error> {
-        log::info!("toggle write for {} - read: {}", url, read);
+        log::trace!("toggle write for {} - read: {}", url, read);
         let msg = PoolInput::ToggleReadFor(url.to_owned(), read);
         self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+            .send(msg)
+            .map_err(|e| Error::SendToPoolTaskFailed(format!("ToggleReadFor. error: {}", e)))?;
         Ok(())
     }
     pub fn toggle_write_for(&self, url: &Url, write: bool) -> Result<(), Error> {
-        log::info!("toggle write for {} - write: {}", url, write);
+        log::trace!("toggle write for {} - write: {}", url, write);
         let msg = PoolInput::ToggleWriteFor(url.to_owned(), write);
         self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+            .send(msg)
+            .map_err(|e| Error::SendToPoolTaskFailed(format!("ToggleWriteFor. error: {}", e)))?;
         Ok(())
     }
 
     pub fn relays_info(&self) -> Result<(), Error> {
-        log::info!("relays information list");
+        log::trace!("relays information list");
         let msg = PoolInput::GetAllRelaysInformation;
-        self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+        self.outside_tx.send(msg).map_err(|e| {
+            Error::SendToPoolTaskFailed(format!("GetAllRelaysInformation. error: {}", e))
+        })?;
         Ok(())
     }
     pub fn relay_info(&self, url: &Url) -> Result<(), Error> {
-        log::info!("relay info {}", url);
+        log::trace!("relay info {}", url);
         let msg = PoolInput::GetRelayInformation(url.to_owned());
-        self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+        self.outside_tx.send(msg).map_err(|e| {
+            Error::SendToPoolTaskFailed(format!("GetRelayInformation. error: {}", e))
+        })?;
         Ok(())
     }
     pub fn relay_eose_actions(
@@ -389,26 +388,30 @@ impl RelayPool {
     ) -> Result<(), Error> {
         let msg = PoolInput::EoseActionsTo(url.to_owned(), actions_id.to_owned(), actions);
         self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+            .send(msg)
+            .map_err(|e| Error::SendToPoolTaskFailed(format!("EoseActionsTo. error: {}", e)))?;
         Ok(())
     }
     pub async fn relay_status_list(&self) -> Result<RelayStatusList, Error> {
-        log::info!("relays status list");
-        let (tx, mut rx) = mpsc::channel(1);
+        log::trace!("relays status list");
+        let (tx, rx) = oneshot::channel();
         let msg = PoolInput::GetRelayStatusList(tx);
 
-        self.outside_tx
-            .send(msg.clone())
-            .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
+        self.outside_tx.send(msg).map_err(|e| {
+            Error::SendToPoolTaskFailed(format!("GetRelayStatusList. error: {}", e))
+        })?;
 
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(3)) => (),
-            list = rx.recv() => {
-                if let Some(list) = list {
-                    return Ok(list)
-                }
-            }
+        // tokio::select! {
+        //     _ = tokio::time::sleep(Duration::from_secs(3)) => (),
+        //     list_result = rx => {
+        //         if let Ok(list) = list_result {
+        //             return Ok(list)
+        //         }
+        //     }
+        // }
+
+        if let Ok(list) = rx.await {
+            return Ok(list);
         }
 
         Err(Error::UnableToGetRelaysStatus)
@@ -417,7 +420,7 @@ impl RelayPool {
 
 pub type RelayStatusList = Vec<(Url, RelayStatus)>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum PoolInput {
     AddRelay(Url, RelayOptions),
     ReconnectRelay(Url),
@@ -431,7 +434,7 @@ pub enum PoolInput {
     GetRelayInformation(Url),
     GetAllRelaysInformation,
     EoseActionsTo(Url, String, Vec<Subscription>),
-    GetRelayStatusList(mpsc::Sender<RelayStatusList>),
+    GetRelayStatusList(oneshot::Sender<RelayStatusList>),
 }
 #[derive(Debug, Clone)]
 pub struct RelayToPool {

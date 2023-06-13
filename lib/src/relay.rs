@@ -372,14 +372,21 @@ impl Relay {
         &mut self,
         input: Option<RelayInput>,
     ) -> Option<(LoopControl, RelayState)> {
+        log::debug!("{} - handle_input_disconnected - {:?}", &self.url, &input);
+
         if let Some(input) = input {
             match input {
                 RelayInput::Close => {
                     log::debug!("Closing relay");
-                    _ = self
+                    if let Err(e) = self
                         .pool_tx
                         .send(RelayToPoolEvent::Closed.into(&self.url))
-                        .await;
+                        .await
+                    {
+                        log::debug!("error sending to pool: {}", e);
+                        return Some((LoopControl::Break, RelayState::Terminated));
+                    }
+
                     self.terminated();
                     return Some((LoopControl::Continue, RelayState::Terminated));
                 }
@@ -404,20 +411,29 @@ impl Relay {
         let attempts = self.attempts();
         if attempts >= MAX_ATTEMPS {
             log::debug!("{} - max attempts exceeded - {}", &self.url, attempts);
-            _ = self
+            if let Err(e) = self
                 .pool_tx
                 .send(RelayToPoolEvent::MaxAttempsExceeded.into(&self.url))
-                .await;
+                .await
+            {
+                log::debug!("error sending to pool: {}", e);
+                return (LoopControl::Break, RelayState::Terminated);
+            }
+
             return (LoopControl::Continue, RelayState::Terminated);
         }
 
         let (conn_tx, conn_rx) = oneshot::channel();
         spawn_get_connection(self.url.clone(), conn_tx);
 
-        _ = self
+        if let Err(e) = self
             .pool_tx
             .send(RelayToPoolEvent::AttempToConnect.into(&self.url))
-            .await;
+            .await
+        {
+            log::debug!("error sending to pool: {}", e);
+            return (LoopControl::Break, RelayState::Terminated);
+        }
 
         (
             LoopControl::Continue,
@@ -434,10 +450,16 @@ impl Relay {
                 }
                 RelayInput::Reconnect => {
                     self.disconnected();
-                    _ = self
+
+                    if let Err(e) = self
                         .pool_tx
                         .send(RelayToPoolEvent::Reconnecting.into(&self.url))
-                        .await;
+                        .await
+                    {
+                        log::debug!("error sending to pool: {}", e);
+                        return (LoopControl::Break, RelayState::Terminated);
+                    }
+
                     return (LoopControl::Continue, RelayState::new());
                 }
                 other => self.handle_input_disconnected_other(other),
@@ -453,7 +475,7 @@ impl Relay {
         if let RelayState::Disconnected { delay } = &mut state {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(*delay)) => {
-                    log::debug!("{} - sleeping", &self.url);
+                    log::debug!("{} - slept {}ms", &self.url, delay);
                 },
                 input = self.input.recv() => {
                     if let Some((ctrl, state)) = self.handle_input_disconnected(input).await {
@@ -476,10 +498,16 @@ impl Relay {
                         match input {
                             RelayInput::Close => {
                                 log::debug!("Closing relay");
-                                _ = self
+
+                                if let Err(e) = self
                                     .pool_tx
                                     .send(RelayToPoolEvent::Closed.into(&self.url))
-                                    .await;
+                                    .await
+                                {
+                                    log::debug!("error sending to pool: {}", e);
+                                    return (LoopControl::Break, RelayState::Terminated);
+                                }
+
                                 self.terminated();
                                 return (LoopControl::Continue, RelayState::Terminated);
                             }
@@ -505,27 +533,45 @@ impl Relay {
                                 );
                                 let (ws_write, ws_read) = ws_stream.split();
                                 self.new_success();
-                                _ = self
+
+                                if let Err(e) = self
                                     .pool_tx
                                     .send(RelayToPoolEvent::ConnectedToSocket.into(&self.url))
-                                    .await;
+                                    .await
+                                {
+                                    log::debug!("error sending to pool: {}", e);
+                                    return (LoopControl::Break, RelayState::Terminated);
+                                }
+
                                 return (LoopControl::Continue, RelayState::Connected { ws_read, ws_write })
                             }
                             Err(e) => {
                                 log::debug!("{} - Retrying. Err: {}", &self.url, e);
-                                _ = self
+
+                                if let Err(e) = self
                                     .pool_tx
                                     .send(RelayToPoolEvent::FailedToConnect.into(&self.url))
-                                    .await;
+                                    .await
+                                {
+                                    log::debug!("error sending to pool: {}", e);
+                                    return (LoopControl::Break, RelayState::Terminated);
+                                }
+
                                 return (LoopControl::Continue, RelayState::retry_with_delay(*delay));
                             }
                         },
                         Err(e) => {
                             log::debug!("{} - Terminate. Err: {}", &self.url, e);
-                            _ = self
+
+                            if let Err(e) = self
                                 .pool_tx
                                 .send(RelayToPoolEvent::TerminateRelay.into(&self.url))
-                                .await;
+                                .await
+                            {
+                                log::debug!("error sending to pool: {}", e);
+                                return (LoopControl::Break, RelayState::Terminated);
+                            }
+
                             self.terminated();
                             return (LoopControl::Continue, RelayState::Terminated);
                         }
@@ -546,10 +592,16 @@ impl Relay {
             RelayInput::Close => {
                 log::debug!("Closing relay");
                 _ = ws_write.close().await;
-                _ = self
+
+                if let Err(e) = self
                     .pool_tx
                     .send(RelayToPoolEvent::Closed.into(&self.url))
-                    .await;
+                    .await
+                {
+                    log::debug!("error sending to pool: {}", e);
+                    return Some((LoopControl::Break, RelayState::Terminated));
+                }
+
                 self.terminated();
                 return Some((LoopControl::Continue, RelayState::Terminated));
             }
@@ -584,10 +636,14 @@ impl Relay {
             }
             RelayInput::SendEvent(event) => self.send_event(event, ws_write).await,
             RelayInput::Subscribe(subscription) => {
-                self.subscribe(&subscription, ws_write).await;
-                self.subscriptions
-                    .insert(subscription.id.clone(), subscription);
-                Ok(())
+                match self.subscribe(&subscription, ws_write).await {
+                    Ok(_) => {
+                        self.subscriptions
+                            .insert(subscription.id.clone(), subscription);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
             }
             RelayInput::EoseActions(action_id, subscriptions) => {
                 if let Some(subscription) = subscriptions.first() {
@@ -688,13 +744,22 @@ impl Relay {
                             }
                         }
                         Some(Ok(msg)) if msg.is_close() => {
-                            _ = self.pool_tx.send(RelayToPoolEvent::RelayDisconnected.into(&self.url)).await;
+                            if let Err(e) = self.pool_tx.send(RelayToPoolEvent::RelayDisconnected.into(&self.url)).await {
+                                log::debug!("error sending to pool: {}", e);
+                                return (LoopControl::Break, RelayState::Terminated);
+                            }
+
                             self.terminated();
                             return (LoopControl::Continue, RelayState::Disconnected { delay: 0 });
                         }
                         Some(Err(e)) => {
                             log::debug!("Error reading message from {}: {}", &self.url, e);
-                            _ = self.pool_tx.send(RelayToPoolEvent::RelayDisconnected.into(&self.url)).await;
+
+                            if let Err(e) = self.pool_tx.send(RelayToPoolEvent::RelayDisconnected.into(&self.url)).await{
+                                log::debug!("error sending to pool: {}", e);
+                                return (LoopControl::Break, RelayState::Terminated);
+                            }
+
                             self.terminated();
                             return (LoopControl::Continue, RelayState::Disconnected { delay: 0 });
                         }
@@ -966,41 +1031,3 @@ pub enum SubscriptionType {
 
 const MAX_ERROR_MSGS_LIMIT: u8 = 100;
 const MAX_ATTEMPS: usize = 7;
-
-// match doc_rx.await {
-//     Ok(Ok(document)) => {
-//         relay.set_document(&document);
-//         // Some(RelayEvent::RelayNotification(
-//         //     RelayNotificationEvent::RelayDocument(Some(document)),
-//         // ))
-//     }
-//     Ok(Err(e)) => {
-//         log::info!("{} - doc err: {}", &relay.url, e);
-//     }
-//     Err(e) => {
-//         log::trace!("{} - doc_rx closed", &relay.url);
-//     }
-// }
-
-// if self.document.is_none() && !self.is_document_requested {
-//     let (doc_tx, doc_rx) = oneshot::channel();
-
-//     spawn_get_document(self.url.to_owned(), doc_tx);
-
-//     match doc_rx.await {
-//         Ok(Ok(document)) => {
-//             self.set_document(&document);
-//             _ = self.notification_tx.send(
-//                 RelayEvent::RelayDocument(Some(document)).into(&self.url),
-//             );
-//         }
-//         Ok(Err(e)) => {
-//             // failed to fetch document
-//             log::debug!("{} - doc err: {}", &self.url, e);
-//         }
-//         Err(e) => {
-//             log::debug!("{} - doc err: {}", &self.url, e);
-//         }
-//     }
-//     self.is_document_requested = true;
-// }
