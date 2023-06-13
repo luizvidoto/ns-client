@@ -406,7 +406,6 @@ impl Relay {
 
     async fn try_connect(&mut self, delay: u64) -> (LoopControl, RelayState) {
         log::debug!("{} - Trying to connect", &self.url);
-        self.new_attempt();
 
         let attempts = self.attempts();
         if attempts >= MAX_ATTEMPS {
@@ -434,6 +433,7 @@ impl Relay {
             log::debug!("error sending to pool: {}", e);
             return (LoopControl::Break, RelayState::Terminated);
         }
+        self.new_attempt();
 
         (
             LoopControl::Continue,
@@ -449,8 +449,6 @@ impl Relay {
                     log::debug!("Ignoring Closing relay. Relay is terminated");
                 }
                 RelayInput::Reconnect => {
-                    self.disconnected();
-
                     if let Err(e) = self
                         .pool_tx
                         .send(RelayToPoolEvent::Reconnecting.into(&self.url))
@@ -459,6 +457,7 @@ impl Relay {
                         log::debug!("error sending to pool: {}", e);
                         return (LoopControl::Break, RelayState::Terminated);
                     }
+                    self.disconnected();
 
                     return (LoopControl::Continue, RelayState::new());
                 }
@@ -507,8 +506,8 @@ impl Relay {
                                     log::debug!("error sending to pool: {}", e);
                                     return (LoopControl::Break, RelayState::Terminated);
                                 }
-
                                 self.terminated();
+
                                 return (LoopControl::Continue, RelayState::Terminated);
                             }
                             RelayInput::Reconnect => {
@@ -532,7 +531,6 @@ impl Relay {
                                     self.subscriptions.len()
                                 );
                                 let (ws_write, ws_read) = ws_stream.split();
-                                self.new_success();
 
                                 if let Err(e) = self
                                     .pool_tx
@@ -542,6 +540,7 @@ impl Relay {
                                     log::debug!("error sending to pool: {}", e);
                                     return (LoopControl::Break, RelayState::Terminated);
                                 }
+                                self.new_success();
 
                                 return (LoopControl::Continue, RelayState::Connected { ws_read, ws_write })
                             }
@@ -556,6 +555,7 @@ impl Relay {
                                     log::debug!("error sending to pool: {}", e);
                                     return (LoopControl::Break, RelayState::Terminated);
                                 }
+                                self.disconnected();
 
                                 return (LoopControl::Continue, RelayState::retry_with_delay(*delay));
                             }
@@ -571,8 +571,8 @@ impl Relay {
                                 log::debug!("error sending to pool: {}", e);
                                 return (LoopControl::Break, RelayState::Terminated);
                             }
-
                             self.terminated();
+
                             return (LoopControl::Continue, RelayState::Terminated);
                         }
                     }
@@ -601,8 +601,8 @@ impl Relay {
                     log::debug!("error sending to pool: {}", e);
                     return Some((LoopControl::Break, RelayState::Terminated));
                 }
-
                 self.terminated();
+
                 return Some((LoopControl::Continue, RelayState::Terminated));
             }
             other => self.handle_other_inputs_connected(ws_write, other).await,

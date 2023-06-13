@@ -171,6 +171,7 @@ impl RelayPoolTask {
 
     async fn send_to_listener(&mut self, url: &Url, input: RelayInput) {
         if let Some(listener) = self.relays.get_mut(&url) {
+            // maybe another task here?
             if let Err(e) = listener.relay_tx.send(input).await {
                 log::debug!("Failed to send to relay: {}", e);
             }
