@@ -690,10 +690,13 @@ impl Relay {
                         Some(Ok(msg)) if msg.is_close() => {
                             _ = self.pool_tx.send(RelayToPoolEvent::RelayDisconnected.into(&self.url)).await;
                             self.terminated();
-                            return (LoopControl::Continue, RelayState::Terminated);
+                            return (LoopControl::Continue, RelayState::Disconnected { delay: 0 });
                         }
                         Some(Err(e)) => {
                             log::debug!("Error reading message from {}: {}", &self.url, e);
+                            _ = self.pool_tx.send(RelayToPoolEvent::RelayDisconnected.into(&self.url)).await;
+                            self.terminated();
+                            return (LoopControl::Continue, RelayState::Disconnected { delay: 0 });
                         }
                         _ => (),
                     }
@@ -962,7 +965,7 @@ pub enum SubscriptionType {
 }
 
 const MAX_ERROR_MSGS_LIMIT: u8 = 100;
-const MAX_ATTEMPS: usize = 3;
+const MAX_ATTEMPS: usize = 7;
 
 // match doc_rx.await {
 //     Ok(Ok(document)) => {

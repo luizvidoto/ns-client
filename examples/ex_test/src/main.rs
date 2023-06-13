@@ -1,6 +1,6 @@
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
-use nostr::{secp256k1::XOnlyPublicKey, Filter, Kind, RelayMessage, Timestamp};
+use nostr::{Filter, Kind, RelayMessage, Timestamp};
 use ns_client::{RelayEvent, Subscription};
 use tokio::signal;
 
@@ -175,9 +175,18 @@ async fn main() {
     //     .with_id("contact_list_metadata");
     // pool.subscribe(&subscription).unwrap();
 
+    let loop_h = tokio::spawn(async move {
+        loop {
+            let list = pool.relay_status_list().await;
+            log::info!("APP: Relay status list: {:?}", list);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+
     tokio::select! {
         _ = shutdown_signal() => {}
         _ = pool_h => {}
+        _ = loop_h => {}
     }
 }
 

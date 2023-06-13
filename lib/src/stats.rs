@@ -46,6 +46,7 @@ impl RelayConnectionStats {
 
     pub(crate) fn new_success(&mut self) {
         self.success += 1;
+        self.attempts = 0;
         self.connected_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")

@@ -1,5 +1,6 @@
 use nostr::SubscriptionId;
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use url::Url;
 
@@ -401,11 +402,16 @@ impl RelayPool {
             .send(msg.clone())
             .map_err(|e| Error::SendToPoolTaskFailed(e.to_string(), msg.clone()))?;
 
-        if let Some(list) = rx.recv().await {
-            Ok(list)
-        } else {
-            Err(Error::UnableToGetRelaysStatus)
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(3)) => (),
+            list = rx.recv() => {
+                if let Some(list) = list {
+                    return Ok(list)
+                }
+            }
         }
+
+        Err(Error::UnableToGetRelaysStatus)
     }
 }
 
