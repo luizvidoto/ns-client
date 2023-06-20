@@ -1,4 +1,4 @@
-use nostr::SubscriptionId;
+use nostr::{Event, SubscriptionId};
 use std::collections::HashMap;
 use tokio::sync::oneshot;
 use tokio::sync::{broadcast, mpsc};
@@ -188,6 +188,10 @@ impl RelayPoolTask {
 
     async fn handle_input(&mut self, input: PoolInput) -> bool {
         match input {
+            PoolInput::Auth(url, event) => {
+                log::debug!("Auth to {}", url);
+                self.send_to_listener(&url, RelayInput::Auth(event)).await;
+            }
             PoolInput::EoseActionsTo(url, actions_id, subscriptions) => {
                 log::debug!("Eose actions to {} - {:?}", url, subscriptions);
                 self.send_to_listener(&url, RelayInput::EoseActions(actions_id, subscriptions))
@@ -417,6 +421,14 @@ impl RelayPool {
 
         Err(Error::UnableToGetRelaysStatus)
     }
+    /// Send auth event to selected relay. [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md)
+    pub fn send_auth(&self, relay_url: &Url, auth_event: Event) -> Result<(), Error> {
+        let msg = PoolInput::Auth(relay_url.to_owned(), auth_event);
+        self.outside_tx
+            .send(msg)
+            .map_err(|e| Error::SendToPoolTaskFailed(format!("EoseActionsTo. error: {}", e)))?;
+        Ok(())
+    }
 }
 
 pub type RelayStatusList = Vec<(Url, RelayStatus)>;
@@ -427,7 +439,7 @@ pub enum PoolInput {
     ReconnectRelay(Url),
     AddSubscription(Subscription),
     Shutdown,
-    SendEvent(nostr::Event),
+    SendEvent(Event),
     RemoveRelay(Url),
     ToggleReadFor(Url, bool),
     ToggleWriteFor(Url, bool),
@@ -436,6 +448,7 @@ pub enum PoolInput {
     GetAllRelaysInformation,
     EoseActionsTo(Url, String, Vec<Subscription>),
     GetRelayStatusList(oneshot::Sender<RelayStatusList>),
+    Auth(Url, Event),
 }
 #[derive(Debug, Clone)]
 pub struct RelayToPool {
@@ -458,7 +471,9 @@ async fn process_add_relay(
     let (relay_input_sender, relay_input_receiver) = mpsc::channel(RELAY_INPUT_CHANNEL_SIZE);
     let mut relay = Relay::new(&url, relay_input_receiver, pool_tx, notification_tx, opts);
     tokio::spawn(async move {
-        relay.run().await;
+        if let Err(e) = relay.run().await {
+            log::debug!("{}", e);
+        }
     });
     listeners.insert(url.clone(), RelayListener::new(relay_input_sender));
 }
